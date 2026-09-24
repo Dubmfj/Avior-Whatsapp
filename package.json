@@ -4,7 +4,8 @@
   "description": "Bot comercial de WhatsApp para Scroll Studios",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "build": "rm -rf .puppeteer-cache .cache && npx puppeteer browsers install chrome"
   },
   "keywords": [],
   "author": "",
@@ -13,6 +14,7 @@
     "axios": "^1.6.8",
     "dotenv": "^16.4.5",
     "nodemailer": "^6.9.13",
+    "puppeteer": "^22.6.0",
     "qrcode-terminal": "^0.12.0",
     "whatsapp-web.js": "^1.23.0"
   },
