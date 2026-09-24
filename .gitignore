@@ -1,0 +1,5 @@
+node_modules/
+session-avior/
+.wwebjs_cache/
+historiales.json
+pausas.json
