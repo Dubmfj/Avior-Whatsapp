@@ -4,5 +4,6 @@ const { join } = require('path');
  * @type {import("puppeteer").Configuration}
  */
 module.exports = {
-  cacheDirectory: join(__dirname, '.cache', 'puppeteer'),
+  // Asegura que Chromium se descargue dentro de la carpeta del proyecto
+  cacheDirectory: join(__dirname, '.puppeteer-cache'),
 };

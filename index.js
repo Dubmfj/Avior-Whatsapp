@@ -391,11 +391,13 @@ PREGUNTA: (Duda o petición del cliente)
 // =========================================================================
 // 5. INICIALIZACIÓN DE WHATSAPP (OPTIMIZADO PARA LINUX Y RENDER)
 // =========================================================================
+// =========================================================================
+// 5. INICIALIZACIÓN DE WHATSAPP (OPTIMIZADO PARA LINUX Y RENDER)
+// =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
-        executablePath: puppeteer.executablePath(),
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
