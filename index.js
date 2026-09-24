@@ -3,6 +3,20 @@ const qrcode = require('qrcode-terminal');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const puppeteer = require('puppeteer');
+
+// =========================================================================
+// 0. HEALTH CHECK HTTP PARA RENDER (EVITA QUE RENDER MATE LA INSTANCIA)
+// =========================================================================
+const PORT = process.env.PORT || 10000;
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Avi WhatsApp Bot - Service Active');
+});
+server.listen(PORT, () => {
+    console.log(`🌐 Servidor HTTP activo en el puerto ${PORT} (Health Check para Render)`);
+});
 
 // Endpoint de la API en Render
 const API_URL = 'https://avior-ai.onrender.com/api/chat-wsp';
@@ -157,7 +171,7 @@ function estaChatPausado(chatId) {
 }
 
 // =========================================================================
-// 4. PROMPT MAESTRO DE AVI (33 REGLAS + ESTRATEGIA DEL 3ER MENSAJE)
+// 4. PROMPT MAESTRO DE AVI
 // =========================================================================
 const PROMPT_SISTEMA_AVI = `
 AVI — ASISTENTE COMERCIAL OFICIAL DE SCROLL STUDIOS
@@ -375,12 +389,13 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (OPTIMIZADO PARA RENDER Y SERVIDORES)
+// 5. INICIALIZACIÓN DE WHATSAPP (OPTIMIZADO PARA LINUX Y RENDER)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
+        executablePath: puppeteer.executablePath(),
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -419,7 +434,7 @@ client.on('message_create', async (msg) => {
         const userMessage = msg.body ? msg.body.trim() : '';
         const mensajeLower = userMessage.toLowerCase();
 
-        // Extracción segura del ID sin causar crash en getContact
+        // Extracción segura del ID
         let idRemitente = msg.from;
         let numeroReal = idRemitente.replace('@c.us', '');
 
@@ -433,7 +448,6 @@ client.on('message_create', async (msg) => {
             // Ignorar error de Puppeteer 'getAlternateUserWid'
         }
 
-        // Lista de comandos válidos de administración
         const comandosAdmin = [
             '!horario off', '!horario false', '!horario 0',
             '!horario on', '!horario true', '!horario 1',
@@ -441,9 +455,7 @@ client.on('message_create', async (msg) => {
             '!unpause all', '!despausar todo', '!admin', '!help'
         ];
 
-        // -----------------------------------------------------------------
-        // EVALUACIÓN DE COMANDOS DE ADMINISTRACIÓN (PRIMERA PRIORIDAD)
-        // -----------------------------------------------------------------
+        // EVALUACIÓN DE COMANDOS DE ADMINISTRACIÓN
         if (comandosAdmin.includes(mensajeLower)) {
             const esAdmin = esMensajeMio || NUMEROS_ADMIN.includes(idRemitente) || idRemitente === MI_CHAT_PERSONAL;
 
@@ -510,10 +522,7 @@ client.on('message_create', async (msg) => {
             }
         }
 
-        // -----------------------------------------------------------------
         // FILTROS Y CONTROLES DE SEGURIDAD
-        // -----------------------------------------------------------------
-        // 1. Auto-pausa por intervención humana en chats de terceros
         if (esMensajeMio) {
             if (idRemitente.endsWith('@g.us') || idRemitente === MI_CHAT_PERSONAL) return;
             
@@ -524,14 +533,12 @@ client.on('message_create', async (msg) => {
             return;
         }
 
-        // 2. Ignorar mensajes de grupos o chat personal
         if (idRemitente.endsWith('@g.us') || idRemitente === MI_CHAT_PERSONAL) return;
 
-        // 3. Verificar estado de pausas y horario
         if (estaChatPausado(idRemitente)) return;
         if (!esHorarioDeBot()) return;
 
-        // 4. Control Anti-Spam
+        // Anti-Spam
         const ahora = Date.now();
         if (!registroSpam[idRemitente]) {
             registroSpam[idRemitente] = [];
@@ -547,7 +554,7 @@ client.on('message_create', async (msg) => {
             return;
         }
 
-        // 5. Archivos multimedia o audios
+        // Archivos multimedia o audios
         if (msg.hasMedia || msg.type === 'audio' || msg.type === 'ptt') {
             await msg.reply('¡Hola! Por el momento solo puedo leer mensajes en texto. ¿En qué te puedo ayudar?');
             return;
@@ -555,9 +562,7 @@ client.on('message_create', async (msg) => {
 
         if (!userMessage) return;
 
-        // -----------------------------------------------------------------
         // PROCESAMIENTO CON LA API EN RENDER
-        // -----------------------------------------------------------------
         agregarMensajeAHistorial(idRemitente, 'user', userMessage);
         console.log(`[Mensaje Recibido] De: +${numeroReal} | Texto: "${userMessage}"`);
 
@@ -588,7 +593,6 @@ client.on('message_create', async (msg) => {
         if (response.status === 200) {
             let replyText = response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.';
 
-            // Handoff a Asesor Humano
             if (replyText.includes('[TRANSFERIR_HUMANO]')) {
                 const regex = /\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i;
                 const match = replyText.match(regex);
