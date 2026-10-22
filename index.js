@@ -688,6 +688,11 @@ async function main() {
     // Espera aquí hasta que la instancia vieja de Render suelte la sesión de WhatsApp
     lockClient = await adquirirBloqueo(pool);
     await cargarMemoria();
+    if (GEMINI_API_KEY) {
+        console.log(`🤖 Modo Gemini DIRECTO activo (modelo: ${GEMINI_MODEL}).`);
+    } else {
+        console.log('⚠️ GEMINI_API_KEY no está definida en este servicio: se usa la API de avior-ai (da 429). Agrégala en Environment.');
+    }
     await iniciarBot();
 }
 
