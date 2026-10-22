@@ -1,7 +1,6 @@
-# Usamos Node.js sobre Debian (Bullseye) que soporta Chromium nativamente
-FROM node:18-bullseye
+FROM node:18-bookworm
 
-# Instalamos Chromium y dependencias del sistema necesarias
+# Instalamos Chromium y dependencias del sistema de forma limpia
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
