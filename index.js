@@ -262,7 +262,7 @@ Haz preguntas solamente cuando ayuden a determinar qué solución necesita.
 Scroll Studios no vende tecnología por sí misma.
 Vende soluciones y resultados digitales.
 Un cliente normalmente no quiere: HTML, CSS, JavaScript, GSAP, APIs, servidores, código.
-El cliente quiere: verse profesional, conseguir clientes, recibir consultas, mostrar sus productos, vender, facilitar reservas, automatizar procesos, ahorrar tiempo, tener presencia digital, mejorar la experiencia de sus clientes.
+El cliente quiere: verse profesional, conseguir clientes, recibir consultas, mostrar sus productos, vender, facilitar reservas, automatizar procesos, ahorrar tiempo, tener presencia digital, mejorar la experiencia sus clientes.
 Por eso debes hablar primero del resultado y el valor para el negocio.
 La tecnología solamente debe mencionarse cuando:
 - el cliente pregunta específicamente por ella;
@@ -369,7 +369,7 @@ Plantea 2 opciones resumidas si aplican y sugiere revisarlo en la reunión.
 El único paso de cierre por WhatsApp es agendar la llamada o solicitar datos de contacto.
 
 19. NO PERSEGUIR AL CLIENTE
-Si el usuario says "Lo voy a pensar", responde amable, sin presionar y dejando la puerta abierta.
+If the user says "Lo voy a pensar", responde amable, sin presionar y dejando la puerta abierta.
 
 20. CIERRE CUANDO EL PRESUPUESTO ES BAJO
 Sugiérele adaptar o simplificar el alcance del proyecto para ajustarse a su presupuesto en lugar de hacer descuentos arbitrarios.
@@ -414,7 +414,7 @@ Tu misión es: ENTENDER → DIAGNOSTICAR → DEMOSTRAR VALOR → DAR REFERENCIA 
 NUNCA menciones nombres de bots web ni envíes al cliente a probar demos solo. La demostración la realizamos nosotros en la reunión.
 
 33. REGLA DE SOLICITUD DE ASESOR HUMANO (HANDOFF)
-Si el cliente pide hablar con un humano o persona real:
+If the client asks to speak with a human:
 - Responde amablemente confirmando que un asesor tomará la conversación en breve.
 - OBLIGATORIO: Agrega al final de tu respuesta el siguiente bloque exacto:
 [TRANSFERIR_HUMANO]
@@ -424,10 +424,12 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (DOCKER OPTIMIZADO)
+// 5. INICIALIZACIÓN DE WHATSAPP (ESTABLE Y PERSISTENTE)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 0,
     puppeteer: {
         headless: true,
         executablePath: '/usr/bin/chromium',
@@ -438,7 +440,10 @@ const client = new Client({
             '--disable-accelerated-2d-canvas',
             '--no-gpu',
             '--disable-software-rasterizer',
-            '--disable-extensions'
+            '--disable-extensions',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu-sandbox'
         ]
     }
 });
@@ -450,10 +455,22 @@ client.on('qr', (qr) => {
     qrcode.generate(qr, { small: true });
 });
 
+client.on('loading_screen', (percent, message) => {
+    console.log(`⏳ Cargando WhatsApp Web: ${percent}% - ${message}`);
+});
+
+client.on('authenticated', () => {
+    console.log('🔑 ¡Sesión autenticada con éxito!');
+});
+
+client.on('auth_failure', (msg) => {
+    console.error('❌ Error de autenticación:', msg);
+});
+
 client.on('ready', () => {
     latestQR = ''; // Limpiamos el QR al conectar
     console.log(`\n==============================================`);
-    console.log(`¡Avi en línea! Conectado con éxito y listo para producción.`);
+    console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp.`);
     console.log(`==============================================\n`);
 });
 
