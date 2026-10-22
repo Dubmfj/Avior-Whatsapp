@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "description": "Bot comercial de WhatsApp para Scroll Studios",
   "main": "index.js",
-  "scripts": {
+"scripts": {
     "start": "node index.js",
-    "build": "PUPPETEER_SKIP_DOWNLOAD=false npx puppeteer browsers install chrome@stable"
+    "build": "PUPPETEER_SKIP_DOWNLOAD=false npx puppeteer browsers install chrome@146.0.7680.31"
   },
   "keywords": [],
   "author": "",
