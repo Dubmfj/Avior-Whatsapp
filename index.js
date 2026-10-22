@@ -270,7 +270,7 @@ Cada proyecto debe adaptarse al negocio, su público y sus objetivos.
 5. DIFERENCIADOR PRINCIPAL
 El principal diferencial de Scroll Studios es:
 personalización + diseño + estrategia + desarrollo + experiencia de usuario + automatización + IA cuando realmente aporta valor.
-No afirmes que Scroll es "la mejor agencia", "la número uno", "la más barata" o cualquier otro superlativo que no pueda demostrarse.
+No afirmes que Scroll is "la mejor agencia", "la número uno", "la más barata" o cualquier otro superlativo que no pueda demostrarse.
 No inventes premios, clientes, testimonios, estadísticas ni resultados.
 La propuesta debe transmitir:
 "No hacemos simplemente una página web. Desarrollamos una solución digital adaptada a lo que tu negocio necesita."
@@ -406,18 +406,33 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 4. INICIALIZACIÓN DE BAILEYS (CONEXIÓN ESTABLE Y SEGURA)
+// 4. INICIALIZACIÓN DE BAILEYS (CON FALLBACK DE VERSIÓN Y CONEXIÓN ROBUSTA)
 // =========================================================================
 async function iniciarBot() {
+    console.log('🚀 Iniciando motor de Baileys...');
+    
     const { state, saveCreds } = await useMultiFileAuthState('./session-baileys');
-    const { version } = await fetchLatestBaileysVersion();
+
+    let version = [2, 3000, 1015901307];
+    try {
+        const fetchedVersion = await fetchLatestBaileysVersion();
+        if (fetchedVersion && fetchedVersion.version) {
+            version = fetchedVersion.version;
+        }
+    } catch (e) {
+        console.log('⚠️ No se pudo obtener la versión más reciente. Usando fallback.');
+    }
 
     const sock = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: true,
         logger: pino({ level: 'silent' }),
-        browser: ['Scroll Studios', 'Chrome', '1.0.0']
+        browser: ['Ubuntu', 'Chrome', '120.0.6099.109'],
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: undefined,
+        keepAliveIntervalMs: 25000,
+        emitOwnEvents: true
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -436,10 +451,9 @@ async function iniciarBot() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
-            console.log(`⚠️ Conexión cerrada (Código: ${statusCode}). ¿Reconectar?: ${shouldReconnect}`);
+            console.log(`⚠️ Conexión cerrada (Código: ${statusCode || 'Desconocido'}). ¿Reconectar?: ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                // Esperamos 5 segundos antes de reintentar para saturar la API
                 setTimeout(iniciarBot, 5000);
             } else {
                 console.log('❌ Sesión cerrada permanentemente. Limpiando carpeta session-baileys...');
@@ -510,7 +524,13 @@ async function iniciarBot() {
                     };
 
                     if (mensajeLower === '!admin' || mensajeLower === '!help') {
-                        await responderPrivado(`🛠️ *MENÚ ADMIN*\n\n• *!horario off*\n• *!horario on*\n• *!horario status*\n• *!unpause*\n• *!unpause all*`);
+                        const menuHelp = `🛠️ *MENÚ DE COMANDOS DE ADMINISTRACIÓN*\n\n` +
+                            `• *!horario off* : Desactiva el filtro de horario (24/7).\n` +
+                            `• *!horario on* : Activa el filtro de horario laboral.\n` +
+                            `• *!horario status* : Ver estado actual del filtro.\n` +
+                            `• *!unpause* : Reactiva el bot en el chat actual.\n` +
+                            `• *!unpause all* : Reactiva el bot en TODOS los chats.`;
+                        await responderPrivado(menuHelp);
                         continue;
                     }
 
@@ -518,9 +538,9 @@ async function iniciarBot() {
                         if (chatsPausados[idRemitente]) {
                             delete chatsPausados[idRemitente];
                             guardarPausas();
-                            await responderPrivado(`⚙️ Bot reactivado para +${numeroReal}.`);
+                            await responderPrivado(`⚙️ *ADMIN:* Bot reactivado para el chat de +${numeroReal}.`);
                         } else {
-                            await responderPrivado(`⚙️ El chat no estaba pausado.`);
+                            await responderPrivado(`⚙️ *ADMIN:* El chat de +${numeroReal} no estaba pausado.`);
                         }
                         continue;
                     }
@@ -528,24 +548,25 @@ async function iniciarBot() {
                     if (mensajeLower === '!unpause all' || mensajeLower === '!despausar todo') {
                         chatsPausados = {};
                         guardarPausas();
-                        await responderPrivado('⚙️ Todos los chats despausados.');
+                        await responderPrivado('⚙️ *ADMIN:* Se reactivó el bot en TODOS los chats pausados.');
                         continue;
                     }
 
                     if (mensajeLower === '!horario off' || mensajeLower === '!horario false' || mensajeLower === '!horario 0') {
                         ignorarHorario = true;
-                        await responderPrivado('⚙️ Filtro de horario DESACTIVADO (24/7).');
+                        await responderPrivado('⚙️ *ADMIN:* Modo de prueba activado (Filtro de horario DESACTIVADO).');
                         continue;
                     }
 
                     if (mensajeLower === '!horario on' || mensajeLower === '!horario true' || mensajeLower === '!horario 1') {
                         ignorarHorario = false;
-                        await responderPrivado('⚙️ Filtro de horario ACTIVADO.');
+                        await responderPrivado('⚙️ *ADMIN:* Modo normal activado (Filtro de horario ACTIVADO).');
                         continue;
                     }
 
                     if (mensajeLower === '!horario status') {
-                        await responderPrivado(`⚙️ Estado del horario: ${ignorarHorario ? '24/7' : 'Normal'}`);
+                        const estado = ignorarHorario ? 'DESACTIVADO (Responde 24/7)' : 'ACTIVADO (Respeta horario)';
+                        await responderPrivado(`⚙️ *ADMIN:* Estado del filtro de horario: ${estado}`);
                         continue;
                     }
                 }
@@ -562,13 +583,13 @@ async function iniciarBot() {
                 if (registroSpam[idRemitente].length > 4) {
                     chatsPausados[idRemitente] = ahora + (5 * 60 * 1000);
                     guardarPausas();
-                    await sock.sendMessage(MI_CHAT_PERSONAL, { text: `⚠️ *ANTI-SPAM:* Chat de +${numeroReal} pausado.` });
+                    await sock.sendMessage(MI_CHAT_PERSONAL, { text: `⚠️ *ALERTA ANTI-SPAM:* Se pausó el chat de +${numeroReal}.` });
                     continue;
                 }
 
                 const tipoMsg = Object.keys(msg.message)[0];
                 if (tipoMsg !== 'conversation' && tipoMsg !== 'extendedTextMessage') {
-                    await sock.sendMessage(idRemitente, { text: '¡Hola! Por el momento solo puedo leer mensajes en texto.' }, { quoted: msg });
+                    await sock.sendMessage(idRemitente, { text: '¡Hola! Por el momento solo puedo leer mensajes en texto. ¿En qué te puedo ayudar?' }, { quoted: msg });
                     continue;
                 }
 
@@ -599,7 +620,7 @@ async function iniciarBot() {
                 );
 
                 if (response.status === 200) {
-                    let replyText = response.data.reply || response.data.message || response.data.response || 'Sin respuesta.';
+                    let replyText = response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.';
 
                     if (replyText.includes('[TRANSFERIR_HUMANO]')) {
                         const regex = /\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i;
@@ -613,12 +634,12 @@ async function iniciarBot() {
                             pregunta = match[2].trim();
                         }
 
-                        const mensajeAdmin = `🚨 *ASESOR HUMANO*\n\n📱 *Cliente:* +${numeroReal}\n📋 *Resumen:* ${resumen}\n❓ *Consulta:* ${pregunta}`;
-                        await sock.sendMessage(MI_CHAT_PERSONAL, { text: mensajeAdmin });
+                        const mensajeNotificacionAdmin = `🚨 *SOLICITUD DE ASESOR HUMANO*\n\n📱 *Cliente:* +${numeroReal}\n📋 *Resumen:* ${resumen}\n❓ *Consulta:* ${pregunta}`;
+                        await sock.sendMessage(MI_CHAT_PERSONAL, { text: mensajeNotificacionAdmin });
 
                         replyText = replyText.replace(/\[TRANSFERIR_HUMANO\][\s\S]*?\[\/TRANSFERIR_HUMANO\]/gi, '').trim();
                         if (!replyText) {
-                            replyText = "Claro que sí, un asesor tomará tu caso en breve.";
+                            replyText = "Claro que sí, con gusto. Le acabo de notificar a uno de nuestros asesores para que tome tu caso personalmente en breve.";
                         }
 
                         chatsPausados[idRemitente] = Date.now() + (4 * 60 * 60 * 1000);
@@ -629,11 +650,15 @@ async function iniciarBot() {
                     await sock.sendMessage(idRemitente, { text: replyText }, { quoted: msg });
 
                 } else {
-                    await sock.sendMessage(idRemitente, { text: 'Ocurrió un error temporal en el servidor. Intenta de nuevo.' }, { quoted: msg });
+                    console.log('--- ERROR HTTP DETECTADO EN RENDER ---', response.status);
+                    await sock.sendMessage(idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
                 }
 
             } catch (error) {
-                console.error('Error procesando mensaje:', error?.message || error);
+                console.error('====================================');
+                console.error('   DETALLE DE ERROR EN MENSAJE   ');
+                console.error(error?.message || error);
+                console.error('====================================');
             }
         }
     });
