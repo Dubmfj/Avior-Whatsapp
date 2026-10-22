@@ -440,7 +440,16 @@ const client = new Client({
             '--disable-accelerated-2d-canvas',
             '--no-gpu',
             '--disable-software-rasterizer',
-            '--disable-extensions'
+            '--disable-extensions',
+            '--disable-notifications',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-breakpad',
+            '--disable-component-update',
+            '--disable-features=AudioServiceOutOfProcess',
+            '--disable-ipc-flooding-protection',
+            '--disable-renderer-backgrounding',
+            '--max-old-space-size=256'
         ]
     }
 });
