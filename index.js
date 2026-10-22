@@ -22,6 +22,7 @@ const QR_TOKEN = process.env.QR_TOKEN || '';          // clave para ver el QR: /
 const DATA_DIR = process.env.DATA_DIR || __dirname;   // si algún día usas disco persistente
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';    // pon 'silent' cuando todo ande bien
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || ''; // Render lo define solo
+const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || '').replace(/\D/g, ''); // ej: 51987355501 (vincular con código en vez de QR)
 
 const SESSION_DIR = path.join(DATA_DIR, 'session-baileys');
 const PAUSAS_FILE = path.join(DATA_DIR, 'pausas.json');
@@ -42,6 +43,7 @@ const registroSpam = {};
 let ignorarHorario = false;
 
 let latestQR = '';
+let latestPairingCode = '';
 let conectado = false;
 
 // IDs de mensajes enviados por el propio bot (para no confundirlos con intervención humana)
@@ -67,6 +69,17 @@ const server = http.createServer(async (req, res) => {
         }
 
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+
+        if (latestPairingCode) {
+            return res.end(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Avi WhatsApp - Código de vinculación</title>
+<meta http-equiv="refresh" content="20"></head>
+<body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;background:#111;color:#fff;font-family:sans-serif;text-align:center;padding:0 20px">
+<h1>Código de vinculación para Avi</h1>
+<div style="font-size:56px;letter-spacing:8px;font-weight:bold;background:#fff;color:#111;padding:20px 30px;border-radius:12px">${latestPairingCode}</div>
+<p style="margin-top:24px;color:#aaa;max-width:420px">En WhatsApp: Dispositivos vinculados → Vincular dispositivo → <b>Vincular con el número de teléfono</b> → escribe este código.</p>
+</body></html>`);
+        }
 
         if (latestQR) {
             // El QR se genera aquí mismo: no se envía a ningún servicio externo
@@ -457,8 +470,27 @@ async function iniciarBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
+    let codigoSolicitado = false;
+
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+
+        // Modo código de vinculación (más cómodo que el QR en Render)
+        if (qr && PAIRING_NUMBER && !state.creds.registered && !codigoSolicitado) {
+            codigoSolicitado = true;
+            try {
+                const codigo = await sock.requestPairingCode(PAIRING_NUMBER);
+                latestPairingCode = codigo.match(/.{1,4}/g).join('-');
+                console.log('\n==============================================');
+                console.log(`🔑 CÓDIGO DE VINCULACIÓN: ${latestPairingCode}`);
+                console.log('   WhatsApp → Dispositivos vinculados → Vincular dispositivo');
+                console.log('   → "Vincular con el número de teléfono" → escribe el código');
+                console.log('==============================================\n');
+            } catch (e) {
+                codigoSolicitado = false;
+                console.error('❌ No se pudo generar el código de vinculación:', e?.message || e);
+            }
+        }
 
         if (qr) {
             latestQR = qr;
@@ -479,6 +511,7 @@ async function iniciarBot() {
                 console.log('❌ Sesión cerrada desde el celular. Limpiando sesión para pedir un QR nuevo...');
                 try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch (e) {}
                 latestQR = '';
+                latestPairingCode = '';
                 intentos = 0;
                 return programarReconexion(3000);
             }
@@ -495,6 +528,7 @@ async function iniciarBot() {
         if (connection === 'open') {
             conectado = true;
             latestQR = '';
+            latestPairingCode = '';
             intentos = 0;
             console.log(`\n==============================================`);
             console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp.`);
