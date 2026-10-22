@@ -1,15 +1,18 @@
-FROM node:18-slim
+FROM node:20-slim
 
-# Instalar git necesario para que Baileys descargue dependencias
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates openssl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY package*.json ./
-
-RUN npm install --production
+RUN npm install --omit=dev
 
 COPY . .
+
+ENV NODE_ENV=production
+ENV NODE_OPTIONS=--max-old-space-size=384
 
 EXPOSE 10000
 
