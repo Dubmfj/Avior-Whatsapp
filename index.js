@@ -558,4 +558,108 @@ async function iniciarBot() {
                     }
 
                     if (mensajeLower === '!horario status') {
-                        const estado = ignorarHorario ? 'DESACTIVADO (Responde 24
+                        const estado = ignorarHorario ? 'DESACTIVADO (Responde 24/7)' : 'ACTIVADO (Respeta horario)';
+                        await responderPrivado(`⚙️ *ADMIN:* Estado del filtro de horario: ${estado}`);
+                        continue;
+                    }
+                }
+
+                if (estaChatPausado(idRemitente)) continue;
+                if (!esHorarioDeBot()) continue;
+
+                // Anti-Spam
+                const ahora = Date.now();
+                if (!registroSpam[idRemitente]) {
+                    registroSpam[idRemitente] = [];
+                }
+                
+                registroSpam[idRemitente] = registroSpam[idRemitente].filter(ts => ahora - ts < 10000);
+                registroSpam[idRemitente].push(ahora);
+
+                if (registroSpam[idRemitente].length > 4) {
+                    chatsPausados[idRemitente] = ahora + (5 * 60 * 1000);
+                    guardarPausas();
+                    await sock.sendMessage(MI_CHAT_PERSONAL, { text: `⚠️ *ALERTA ANTI-SPAM:* Se pausó el chat de +${numeroReal}.` });
+                    continue;
+                }
+
+                // Archivos multimedia o audios
+                const tipoMsg = Object.keys(msg.message)[0];
+                if (tipoMsg !== 'conversation' && tipoMsg !== 'extendedTextMessage') {
+                    await sock.sendMessage(idRemitente, { text: '¡Hola! Por el momento solo puedo leer mensajes en texto. ¿En qué te puedo ayudar?' }, { quoted: msg });
+                    continue;
+                }
+
+                if (!userMessage) continue;
+
+                // PROCESAMIENTO CON LA API EN RENDER
+                agregarMensajeAHistorial(idRemitente, 'user', userMessage);
+                console.log(`[Mensaje Recibido] De: +${numeroReal} | Texto: "${userMessage}"`);
+
+                try {
+                    await sock.sendPresenceUpdate('composing', idRemitente);
+                } catch (e) {}
+
+                const response = await axios.post(
+                    API_URL,
+                    {
+                        systemInstruction: PROMPT_SISTEMA_AVI,
+                        message: userMessage,
+                        prompt: userMessage,
+                        userId: idRemitente,
+                        history: historialesChats[idRemitente] || [],
+                        maxTokens: 150
+                    },
+                    {
+                        headers: { 'Content-Type': 'application/json' },
+                        timeout: 120000,
+                        validateStatus: (status) => status >= 200 && status < 600
+                    }
+                );
+
+                if (response.status === 200) {
+                    let replyText = response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.';
+
+                    if (replyText.includes('[TRANSFERIR_HUMANO]')) {
+                        const regex = /\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i;
+                        const match = replyText.match(regex);
+
+                        let resumen = 'El cliente solicitó atención directa.';
+                        let pregunta = userMessage;
+
+                        if (match) {
+                            resumen = match[1].trim();
+                            pregunta = match[2].trim();
+                        }
+
+                        const mensajeNotificacionAdmin = `🚨 *SOLICITUD DE ASESOR HUMANO*\n\n📱 *Cliente:* +${numeroReal}\n📋 *Resumen:* ${resumen}\n❓ *Consulta:* ${pregunta}`;
+                        await sock.sendMessage(MI_CHAT_PERSONAL, { text: mensajeNotificacionAdmin });
+
+                        replyText = replyText.replace(/\[TRANSFERIR_HUMANO\][\s\S]*?\[\/TRANSFERIR_HUMANO\]/gi, '').trim();
+                        if (!replyText) {
+                            replyText = "Claro que sí, con gusto. Le acabo de notificar a uno de nuestros asesores para que tome tu caso personalmente en breve.";
+                        }
+
+                        chatsPausados[idRemitente] = Date.now() + (4 * 60 * 60 * 1000);
+                        guardarPausas();
+                    }
+
+                    agregarMensajeAHistorial(idRemitente, 'model', replyText);
+                    await sock.sendMessage(idRemitente, { text: replyText }, { quoted: msg });
+
+                } else {
+                    console.log('--- ERROR HTTP DETECTADO EN RENDER ---', response.status);
+                    await sock.sendMessage(idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
+                }
+
+            } catch (error) {
+                console.error('====================================');
+                console.error('   DETALLE DEL ERROR DE RED/AXIOS   ');
+                console.error(error?.message || error);
+                console.error('====================================');
+            }
+        }
+    });
+}
+
+iniciarBot();
