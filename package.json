@@ -5,15 +5,15 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "build": "echo 'Build OK'"
+    "build": "rm -rf /opt/render/.cache/puppeteer && npx puppeteer browsers install"
   },
   "dependencies": {
     "axios": "^1.6.8",
     "dotenv": "^16.4.5",
     "nodemailer": "^6.9.13",
-    "puppeteer": "^22.6.0",
+    "puppeteer": "latest",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.23.0"
+    "whatsapp-web.js": "latest"
   },
   "engines": {
     "node": ">=18.0.0"

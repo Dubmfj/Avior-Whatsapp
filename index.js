@@ -389,19 +389,12 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (APUNTANDO AL CHROME DEL SISTEMA RENDER)
+// 5. INICIALIZACIÓN DE WHATSAPP (ESTÁNDAR LIMPIO)
 // =========================================================================
-const fsConstants = require('fs');
-let browserPath = '/usr/bin/google-chrome-stable';
-if (!fsConstants.existsSync(browserPath)) {
-    browserPath = '/usr/bin/chromium';
-}
-
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
-        executablePath: fsConstants.existsSync(browserPath) ? browserPath : undefined,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
