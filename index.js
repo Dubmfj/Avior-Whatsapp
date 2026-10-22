@@ -389,12 +389,13 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (OPTIMIZADO PARA RENDER SIN DOWNLOAD)
+// 5. INICIALIZACIÓN DE WHATSAPP (APUNTANDO AL CHROME DE RENDER)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
+        executablePath: puppeteer.executablePath(), // <--- ESTO CONECTA AMBOS MUNDOS
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
