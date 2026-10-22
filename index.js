@@ -389,13 +389,13 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (CONECTADO AL CHROME ESTABLE)
+// 5. INICIALIZACIÓN DE WHATSAPP (COMPATIBLE CON DOCKER Y LOCAL)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
-        executablePath: puppeteer.executablePath(), // <--- Apuntará perfecto a la 127 instalada
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined, // <--- Lee el Chromium del Dockerfile o se adapta localmente
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
