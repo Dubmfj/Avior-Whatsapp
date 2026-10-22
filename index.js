@@ -389,12 +389,13 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (CORRECTO PARA RENDER)
+// 5. INICIALIZACIÓN DE WHATSAPP (CON RUTA EXPLÍCITA AL CHROME 146)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
+        executablePath: puppeteer.executablePath(), // <--- ¡Ahora sí encontrará la versión 146 exacta!
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
