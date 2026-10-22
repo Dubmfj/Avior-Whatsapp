@@ -1,10 +1,15 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
-const puppeteer = require('puppeteer');
+const qrcode = require('qrcode-terminal');
 
 // =========================================================================
 // 0. SERVIDOR HTTP Y VISUALIZADOR WEB DEL QR PARA RENDER
@@ -37,7 +42,7 @@ const server = http.createServer((req, res) => {
                         <title>Avi WhatsApp Bot</title>
                     </head>
                     <body style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #111; color: white; font-family: sans-serif;">
-                        <h1>¡El bot está encendido y activo!</h1>
+                        <h1>¡El bot está encendido y activo! (Baileys Engine)</h1>
                         <p style="color: #aaa; text-align: center;">Esperando el código QR o ya se encuentra vinculado a una sesión activa.</p>
                     </body>
                 </html>
@@ -64,7 +69,7 @@ const HISTORIALES_FILE = path.join(__dirname, 'historiales.json');
 const NUMEROS_ADMIN = []; 
 
 // 📌 TU CHAT PERSONAL
-const MI_CHAT_PERSONAL = '51987355501@c.us';
+const MI_CHAT_PERSONAL = '51987355501@s.whatsapp.net';
 
 // Memoria principal
 let chatsPausados = {};
@@ -77,30 +82,7 @@ const registroSpam = {};
 let ignorarHorario = false;
 
 // =========================================================================
-// 1. LIMPIEZA DE ARCHIVOS TEMPORALES DE CHROMIUM / PUPPETEER
-// =========================================================================
-function limpiarArchivosTemporales() {
-    try {
-        const sessionPath = path.join(__dirname, 'session-avior');
-        if (fs.existsSync(sessionPath)) {
-            const cacheFolders = ['Default/Cache', 'Default/Code Cache', 'Default/GPUCache'];
-            cacheFolders.forEach((folder) => {
-                const targetFolder = path.join(sessionPath, folder);
-                if (fs.existsSync(targetFolder)) {
-                    fs.rmSync(targetFolder, { recursive: true, force: true });
-                }
-            });
-            console.log('🧹 Caché temporal de Chromium limpiada con éxito.');
-        }
-    } catch (e) {
-        console.error('Error al limpiar caché temporal:', e.message);
-    }
-}
-
-limpiarArchivosTemporales();
-
-// =========================================================================
-// 2. GESTIÓN DE PERSISTENCIA (PAUSAS E HISTORIAL)
+// 1. GESTIÓN DE PERSISTENCIA (PAUSAS E HISTORIAL)
 // =========================================================================
 function cargarMemoria() {
     try {
@@ -149,7 +131,7 @@ function agregarMensajeAHistorial(userId, rol, texto) {
 cargarMemoria();
 
 // =========================================================================
-// 3. CONFIGURACIÓN DE HORARIOS (PERÚ - UTC-5)
+// 2. CONFIGURACIÓN DE HORARIOS (PERÚ - UTC-5)
 // =========================================================================
 function esHorarioDeBot() {
     if (ignorarHorario) {
@@ -206,7 +188,7 @@ function estaChatPausado(chatId) {
 }
 
 // =========================================================================
-// 4. PROMPT MAESTRO DE AVI
+// 3. PROMPT MAESTRO DE AVI (INALTERADO)
 // =========================================================================
 const PROMPT_SISTEMA_AVI = `
 AVI — ASISTENTE COMERCIAL OFICIAL DE SCROLL STUDIOS
@@ -424,282 +406,156 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (ESTABLE Y SIN ARGUMENTOS CONFLICTIVOS)
+// 4. INICIALIZACIÓN DE BAILEYS (MOTOR LIGERO)
 // =========================================================================
-const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './session-avior' }),
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 0,
-    puppeteer: {
-        headless: true,
-        executablePath: '/usr/bin/chromium',
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-gpu',
-            '--disable-software-rasterizer',
-            '--disable-extensions',
-            '--disable-notifications',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-breakpad',
-            '--disable-component-update',
-            '--disable-features=AudioServiceOutOfProcess',
-            '--disable-ipc-flooding-protection',
-            '--disable-renderer-backgrounding',
-            '--max-old-space-size=256'
-        ]
-    }
-});
+async function iniciarBot() {
+    const { state, saveCreds } = await useMultiFileAuthState('./session-baileys');
+    const { version } = await fetchLatestBaileysVersion();
 
-client.on('qr', (qr) => {
-    latestQR = qr;
-    console.log('\n--- CÓDIGO QR RECIBIDO ---');
-    console.log(`🔗 Ábrelo en tu navegador: https://avior-whatsapp.onrender.com`);
-    qrcode.generate(qr, { small: true });
-});
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: true,
+        logger: pino({ level: 'silent' }),
+        browser: ['Scroll Studios', 'Chrome', '1.0.0']
+    });
 
-client.on('loading_screen', (percent, message) => {
-    console.log(`⏳ Cargando WhatsApp Web: ${percent}% - ${message}`);
-});
+    sock.ev.on('creds.update', saveCreds);
 
-client.on('authenticated', () => {
-    console.log('🔑 ¡Sesión autenticada con éxito!');
-});
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-client.on('auth_failure', (msg) => {
-    console.error('❌ Error de autenticación:', msg);
-});
-
-client.on('ready', () => {
-    latestQR = ''; // Limpiamos el QR al conectar
-    console.log(`\n==============================================`);
-    console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp.`);
-    console.log(`==============================================\n`);
-});
-
-client.on('disconnected', async (reason) => {
-    console.log(`⚠️ Cliente desconectado. Razón: ${reason}. Limpiando instancia...`);
-    try {
-        await client.destroy();
-    } catch (err) {
-        console.error('Error al destruir el cliente previo:', err.message);
-    }
-    
-    setTimeout(() => {
-        console.log('🔄 Reiniciando cliente de WhatsApp...');
-        client.initialize();
-    }, 5000);
-});
-
-// =========================================================================
-// 6. MANEJADOR PRINCIPAL DE MENSAJES
-// =========================================================================
-client.on('message_create', async (msg) => {
-    try {
-        const esMensajeMio = msg.fromMe;
-        const userMessage = msg.body ? msg.body.trim() : '';
-        const mensajeLower = userMessage.toLowerCase();
-
-        // Extracción segura del ID
-        let idRemitente = msg.from;
-        let numeroReal = idRemitente.replace('@c.us', '');
-
-        try {
-            const contact = await msg.getContact();
-            if (contact && contact.id) {
-                idRemitente = contact.id._serialized;
-                numeroReal = contact.number || numeroReal;
-            }
-        } catch (eGetContact) {
-            // Ignorar error de Puppeteer 'getAlternateUserWid'
+        if (qr) {
+            latestQR = qr;
+            console.log('\n--- CÓDIGO QR RECIBIDO (BAILEYS) ---');
+            console.log(`🔗 Ábrelo en tu navegador: https://avior-whatsapp.onrender.com`);
+            qrcode.generate(qr, { small: true });
         }
 
-        const comandosAdmin = [
-            '!horario off', '!horario false', '!horario 0',
-            '!horario on', '!horario true', '!horario 1',
-            '!horario status', '!unpause', '!despausar',
-            '!unpause all', '!despausar todo', '!admin', '!help'
-        ];
-
-        // EVALUACIÓN DE COMANDOS DE ADMINISTRACIÓN
-        if (comandosAdmin.includes(mensajeLower)) {
-            const esAdmin = esMensajeMio || NUMEROS_ADMIN.includes(idRemitente) || idRemitente === MI_CHAT_PERSONAL;
-
-            if (!esAdmin) {
-                console.log(`⚠️ Intento no autorizado de ejecutar comando desde: +${numeroReal}`);
-                return;
-            }
-
-            console.log(`⚙️ [ADMIN] Comando ejecutado: "${userMessage}"`);
-
-            const responderPrivado = async (texto) => {
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log(`⚠️ Conexión cerrada. ¿Reconectar?: ${shouldReconnect}`);
+            if (shouldReconnect) {
+                setTimeout(iniciarBot, 5000);
+            } else {
+                console.log('❌ Sesión cerrada. Limpiando carpeta session-baileys...');
                 try {
-                    await msg.reply(texto);
-                } catch (e) {
-                    await client.sendMessage(MI_CHAT_PERSONAL, texto);
-                }
-            };
-
-            if (mensajeLower === '!admin' || mensajeLower === '!help') {
-                const menuHelp = `🛠️ *MENÚ DE COMANDOS DE ADMINISTRACIÓN*\n\n` +
-                    `• *!horario off* : Desactiva el filtro de horario (24/7).\n` +
-                    `• *!horario on* : Activa el filtro de horario laboral.\n` +
-                    `• *!horario status* : Ver estado actual del filtro.\n` +
-                    `• *!unpause* : Reactiva el bot en el chat actual.\n` +
-                    `• *!unpause all* : Reactiva el bot en TODOS los chats.`;
-                await responderPrivado(menuHelp);
-                return;
+                    fs.rmSync('./session-baileys', { recursive: true, force: true });
+                } catch (e) {}
+                setTimeout(iniciarBot, 5000);
             }
+        } else if (connection === 'open') {
+            latestQR = ''; // Limpiamos el QR al conectar
+            console.log(`\n==============================================`);
+            console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp (Baileys).`);
+            console.log(`==============================================\n`);
+        }
+    });
 
-            if (mensajeLower === '!unpause' || mensajeLower === '!despausar') {
-                if (chatsPausados[idRemitente]) {
-                    delete chatsPausados[idRemitente];
+    // =========================================================================
+    // 5. MANEJADOR PRINCIPAL DE MENSAJES (Mapeado exactamente a tu lógica)
+    // =========================================================================
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+
+        for (const msg of messages) {
+            try {
+                if (!msg.message) continue;
+
+                const esMensajeMio = msg.key.fromMe;
+                let idRemitente = msg.key.remoteJid;
+
+                // Ignorar grupos o estados
+                if (!idRemitente || idRemitente.endsWith('@g.us') || idRemitente === 'status@broadcast') continue;
+
+                let numeroReal = idRemitente.replace('@s.whatsapp.net', '');
+
+                // FILTROS Y CONTROLES DE SEGURIDAD (Intervención humana)
+                if (esMensajeMio) {
+                    if (idRemitente === MI_CHAT_PERSONAL) continue;
+                    
+                    chatsPausados[idRemitente] = Date.now() + (2 * 60 * 60 * 1000);
                     guardarPausas();
-                    await responderPrivado(`⚙️ *ADMIN:* Bot reactivado para el chat de +${numeroReal}.`);
-                } else {
-                    await responderPrivado(`⚙️ *ADMIN:* El chat de +${numeroReal} no estaba pausado.`);
-                }
-                return;
-            }
-
-            if (mensajeLower === '!unpause all' || mensajeLower === '!despausar todo') {
-                chatsPausados = {};
-                guardarPausas();
-                await responderPrivado('⚙️ *ADMIN:* Se reactivó el bot en TODOS los chats pausados.');
-                return;
-            }
-
-            if (mensajeLower === '!horario off' || mensajeLower === '!horario false' || mensajeLower === '!horario 0') {
-                ignorarHorario = true;
-                await responderPrivado('⚙️ *ADMIN:* Modo de prueba activado (Filtro de horario DESACTIVADO).');
-                return;
-            }
-
-            if (mensajeLower === '!horario on' || mensajeLower === '!horario true' || mensajeLower === '!horario 1') {
-                ignorarHorario = false;
-                await responderPrivado('⚙️ *ADMIN:* Modo normal activado (Filtro de horario ACTIVADO).');
-                return;
-            }
-
-            if (mensajeLower === '!horario status') {
-                const estado = ignorarHorario ? 'DESACTIVADO (Responde 24/7)' : 'ACTIVADO (Respeta horario)';
-                await responderPrivado(`⚙️ *ADMIN:* Estado del filtro de horario: ${estado}`);
-                return;
-            }
-        }
-
-        // FILTROS Y CONTROLES DE SEGURIDAD
-        if (esMensajeMio) {
-            if (idRemitente.endsWith('@g.us') || idRemitente === MI_CHAT_PERSONAL) return;
-            
-            chatsPausados[idRemitente] = Date.now() + (2 * 60 * 60 * 1000);
-            guardarPausas();
-            
-            console.log(`👤 Intervención humana en +${numeroReal}. Bot silenciado por 2 horas.`);
-            return;
-        }
-
-        if (idRemitente.endsWith('@g.us') || idRemitente === MI_CHAT_PERSONAL) return;
-
-        if (estaChatPausado(idRemitente)) return;
-        if (!esHorarioDeBot()) return;
-
-        // Anti-Spam
-        const ahora = Date.now();
-        if (!registroSpam[idRemitente]) {
-            registroSpam[idRemitente] = [];
-        }
-        
-        registroSpam[idRemitente] = registroSpam[idRemitente].filter(ts => ahora - ts < 10000);
-        registroSpam[idRemitente].push(ahora);
-
-        if (registroSpam[idRemitente].length > 4) {
-            chatsPausados[idRemitente] = ahora + (5 * 60 * 1000);
-            guardarPausas();
-            await client.sendMessage(MI_CHAT_PERSONAL, `⚠️ *ALERTA ANTI-SPAM:* Se pausó el chat de +${numeroReal}.`);
-            return;
-        }
-
-        // Archivos multimedia o audios
-        if (msg.hasMedia || msg.type === 'audio' || msg.type === 'ptt') {
-            await msg.reply('¡Hola! Por el momento solo puedo leer mensajes en texto. ¿En qué te puedo ayudar?');
-            return;
-        }
-
-        if (!userMessage) return;
-
-        // PROCESAMIENTO CON LA API EN RENDER
-        agregarMensajeAHistorial(idRemitente, 'user', userMessage);
-        console.log(`[Mensaje Recibido] De: +${numeroReal} | Texto: "${userMessage}"`);
-
-        try {
-            const chat = await msg.getChat();
-            await chat.sendStateTyping();
-        } catch (errChat) {
-            // Ignorar fallo visual de typing
-        }
-
-        const response = await axios.post(
-            API_URL,
-            {
-                systemInstruction: PROMPT_SISTEMA_AVI,
-                message: userMessage,
-                prompt: userMessage,
-                userId: idRemitente,
-                history: historialesChats[idRemitente] || [],
-                maxTokens: 150
-            },
-            {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 120000,
-                validateStatus: (status) => status >= 200 && status < 600
-            }
-        );
-
-        if (response.status === 200) {
-            let replyText = response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.';
-
-            if (replyText.includes('[TRANSFERIR_HUMANO]')) {
-                const regex = /\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i;
-                const match = replyText.match(regex);
-
-                let resumen = 'El cliente solicitó atención directa.';
-                let pregunta = userMessage;
-
-                if (match) {
-                    resumen = match[1].trim();
-                    pregunta = match[2].trim();
+                    
+                    console.log(`👤 Intervención humana en +${numeroReal}. Bot silenciado por 2 horas.`);
+                    continue;
                 }
 
-                const mensajeNotificacionAdmin = `🚨 *SOLICITUD DE ASESOR HUMANO*\n\n📱 *Cliente:* +${numeroReal}\n📋 *Resumen:* ${resumen}\n❓ *Consulta:* ${pregunta}`;
-                await client.sendMessage(MI_CHAT_PERSONAL, mensajeNotificacionAdmin);
+                if (idRemitente === MI_CHAT_PERSONAL) continue;
 
-                replyText = replyText.replace(/\[TRANSFERIR_HUMANO\][\s\S]*?\[\/TRANSFERIR_HUMANO\]/gi, '').trim();
-                if (!replyText) {
-                    replyText = "Claro que sí, con gusto. Le acabo de notificar a uno de nuestros asesores para que tome tu caso personalmente en breve.";
-                }
+                const userMessage = (
+                    msg.message.conversation ||
+                    msg.message.extendedTextMessage?.text ||
+                    ''
+                ).trim();
+                const mensajeLower = userMessage.toLowerCase();
 
-                chatsPausados[idRemitente] = Date.now() + (4 * 60 * 60 * 1000);
-                guardarPausas();
-            }
+                const comandosAdmin = [
+                    '!horario off', '!horario false', '!horario 0',
+                    '!horario on', '!horario true', '!horario 1',
+                    '!horario status', '!unpause', '!despausar',
+                    '!unpause all', '!despausar todo', '!admin', '!help'
+                ];
 
-            agregarMensajeAHistorial(idRemitente, 'model', replyText);
-            await msg.reply(replyText);
+                // EVALUACIÓN DE COMANDOS DE ADMINISTRACIÓN
+                if (comandosAdmin.includes(mensajeLower)) {
+                    const esAdmin = esMensajeMio || NUMEROS_ADMIN.includes(idRemitente) || idRemitente === MI_CHAT_PERSONAL;
 
-        } else {
-            console.log('--- ERROR HTTP DETECTADO EN RENDER ---', response.status);
-            await msg.reply('Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.');
-        }
+                    if (!esAdmin) {
+                        console.log(`⚠️ Intento no autorizado de ejecutar comando desde: +${numeroReal}`);
+                        continue;
+                    }
 
-    } catch (error) {
-        console.error('====================================');
-        console.error('   DETALLE DEL ERROR DE RED/AXIOS   ');
-        console.error(error?.message || error);
-        console.error('====================================');
-    }
-});
+                    console.log(`⚙️ [ADMIN] Comando ejecutado: "${userMessage}"`);
 
-client.initialize();
+                    const responderPrivado = async (texto) => {
+                        try {
+                            await sock.sendMessage(idRemitente, { text: texto }, { quoted: msg });
+                        } catch (e) {
+                            await sock.sendMessage(MI_CHAT_PERSONAL, { text: texto });
+                        }
+                    };
+
+                    if (mensajeLower === '!admin' || mensajeLower === '!help') {
+                        const menuHelp = `🛠️ *MENÚ DE COMANDOS DE ADMINISTRACIÓN*\n\n` +
+                            `• *!horario off* : Desactiva el filtro de horario (24/7).\n` +
+                            `• *!horario on* : Activa el filtro de horario laboral.\n` +
+                            `• *!horario status* : Ver estado actual del filtro.\n` +
+                            `• *!unpause* : Reactiva el bot en el chat actual.\n` +
+                            `• *!unpause all* : Reactiva el bot en TODOS los chats.`;
+                        await responderPrivado(menuHelp);
+                        continue;
+                    }
+
+                    if (mensajeLower === '!unpause' || mensajeLower === '!despausar') {
+                        if (chatsPausados[idRemitente]) {
+                            delete chatsPausados[idRemitente];
+                            guardarPausas();
+                            await responderPrivado(`⚙️ *ADMIN:* Bot reactivado para el chat de +${numeroReal}.`);
+                        } else {
+                            await responderPrivado(`⚙️ *ADMIN:* El chat de +${numeroReal} no estaba pausado.`);
+                        }
+                        continue;
+                    }
+
+                    if (mensajeLower === '!unpause all' || mensajeLower === '!despausar todo') {
+                        chatsPausados = {};
+                        guardarPausas();
+                        await responderPrivado('⚙️ *ADMIN:* Se reactivó el bot en TODOS los chats pausados.');
+                        continue;
+                    }
+
+                    if (mensajeLower === '!horario off' || mensajeLower === '!horario false' || mensajeLower === '!horario 0') {
+                        ignorarHorario = true;
+                        await responderPrivado('⚙️ *ADMIN:* Modo de prueba activado (Filtro de horario DESACTIVADO).');
+                        continue;
+                    }
+
+                    if (mensajeLower === '!horario on' || mensajeLower === '!horario true' || mensajeLower === '!horario 1') {
+                        ignorarHorario = false;
+                        await responderPrivado('⚙️ *ADMIN:* Modo normal activado (Filtro de horario ACTIVADO).');
+                        continue;
+                    }
+
+                    if (mensajeLower === '!horario status') {
+                        const estado = ignorarHorario ? 'DESACTIVADO (Responde 24

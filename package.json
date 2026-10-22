@@ -1,21 +1,17 @@
 {
   "name": "avior-whatsapp",
   "version": "1.0.0",
-  "description": "Bot comercial de WhatsApp para Scroll Studios",
+  "description": "Bot comercial de Scroll Studios impulsado por Baileys",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "build": "npx puppeteer browsers install chrome@146.0.7680.31"
+    "start": "node index.js"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8",
     "axios": "^1.6.8",
-    "dotenv": "^16.4.5",
-    "nodemailer": "^6.9.13",
-    "puppeteer": "^22.6.0",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.23.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "express": "^4.19.2",
+    "pino": "^8.20.0",
+    "qrcode": "^1.5.3",
+    "qrcode-terminal": "^0.12.0"
   }
 }
