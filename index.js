@@ -389,13 +389,19 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (COMPATIBLE CON DOCKER Y LOCAL)
+// 5. INICIALIZACIÓN DE WHATSAPP (APUNTANDO AL CHROME DEL SISTEMA RENDER)
 // =========================================================================
+const fsConstants = require('fs');
+let browserPath = '/usr/bin/google-chrome-stable';
+if (!fsConstants.existsSync(browserPath)) {
+    browserPath = '/usr/bin/chromium';
+}
+
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined, // <--- Lee el Chromium del Dockerfile o se adapta localmente
+        executablePath: fsConstants.existsSync(browserPath) ? browserPath : undefined,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
