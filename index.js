@@ -313,6 +313,15 @@ async function procesarMensaje(sock, msg) {
     // Ignora lo que envió el propio bot
     if (msg.key.id && mensajesDelBot.has(msg.key.id)) return;
 
+    // CAMBIO 12: ignora mensajes técnicos de WhatsApp (sincronización de historial, claves,
+    // reacciones). Antes contaban como "intervención humana" y pausaban chats sin motivo.
+    const tiposTecnicos = [
+        'protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage',
+        'messageContextInfo', 'pollUpdateMessage', 'keepInChatMessage'
+    ];
+    const tiposReales = Object.keys(msg.message).filter((k) => !tiposTecnicos.includes(k));
+    if (tiposReales.length === 0) return;
+
     const esMensajeMio = msg.key.fromMe;
     const numeroReal = idRemitente.split('@')[0];
     const userMessage = extraerTexto(msg);
