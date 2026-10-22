@@ -389,13 +389,13 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (CON RUTA EXPLÍCITA AL CHROME 146)
+// 5. INICIALIZACIÓN DE WHATSAPP (CONECTADO AL CHROME ESTABLE)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
-        executablePath: puppeteer.executablePath(), // <--- ¡Ahora sí encontrará la versión 146 exacta!
+        executablePath: puppeteer.executablePath(), // <--- Esto usa la ruta exacta del Chrome estable instalado
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',

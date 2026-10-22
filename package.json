@@ -5,7 +5,7 @@
   "main": "index.js",
 "scripts": {
     "start": "node index.js",
-    "build": "PUPPETEER_SKIP_DOWNLOAD=false npx puppeteer browsers install chrome@146.0.7680.31"
+    "build": "PUPPETEER_SKIP_DOWNLOAD=false npx puppeteer browsers install chrome@stable"
   },
   "keywords": [],
   "author": "",
