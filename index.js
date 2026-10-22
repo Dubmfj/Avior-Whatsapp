@@ -406,7 +406,7 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 4. INICIALIZACIÓN DE BAILEYS (MOTOR LIGERO)
+// 4. INICIALIZACIÓN DE BAILEYS (CONEXIÓN ESTABLE Y SEGURA)
 // =========================================================================
 async function iniciarBot() {
     const { state, saveCreds } = await useMultiFileAuthState('./session-baileys');
@@ -433,19 +433,23 @@ async function iniciarBot() {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`⚠️ Conexión cerrada. ¿Reconectar?: ${shouldReconnect}`);
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            
+            console.log(`⚠️ Conexión cerrada (Código: ${statusCode}). ¿Reconectar?: ${shouldReconnect}`);
+            
             if (shouldReconnect) {
+                // Esperamos 5 segundos antes de reintentar para saturar la API
                 setTimeout(iniciarBot, 5000);
             } else {
-                console.log('❌ Sesión cerrada. Limpiando carpeta session-baileys...');
+                console.log('❌ Sesión cerrada permanentemente. Limpiando carpeta session-baileys...');
                 try {
                     fs.rmSync('./session-baileys', { recursive: true, force: true });
                 } catch (e) {}
                 setTimeout(iniciarBot, 5000);
             }
         } else if (connection === 'open') {
-            latestQR = ''; // Limpiamos el QR al conectar
+            latestQR = ''; // Limpiamos el QR al conectar con éxito
             console.log(`\n==============================================`);
             console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp (Baileys).`);
             console.log(`==============================================\n`);
@@ -453,7 +457,7 @@ async function iniciarBot() {
     });
 
     // =========================================================================
-    // 5. MANEJADOR PRINCIPAL DE MENSAJES (Mapeado exactamente a tu lógica)
+    // 5. MANEJADOR PRINCIPAL DE MENSAJES
     // =========================================================================
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
@@ -465,18 +469,14 @@ async function iniciarBot() {
                 const esMensajeMio = msg.key.fromMe;
                 let idRemitente = msg.key.remoteJid;
 
-                // Ignorar grupos o estados
                 if (!idRemitente || idRemitente.endsWith('@g.us') || idRemitente === 'status@broadcast') continue;
 
                 let numeroReal = idRemitente.replace('@s.whatsapp.net', '');
 
-                // FILTROS Y CONTROLES DE SEGURIDAD (Intervención humana)
                 if (esMensajeMio) {
                     if (idRemitente === MI_CHAT_PERSONAL) continue;
-                    
                     chatsPausados[idRemitente] = Date.now() + (2 * 60 * 60 * 1000);
                     guardarPausas();
-                    
                     console.log(`👤 Intervención humana en +${numeroReal}. Bot silenciado por 2 horas.`);
                     continue;
                 }
@@ -497,16 +497,9 @@ async function iniciarBot() {
                     '!unpause all', '!despausar todo', '!admin', '!help'
                 ];
 
-                // EVALUACIÓN DE COMANDOS DE ADMINISTRACIÓN
                 if (comandosAdmin.includes(mensajeLower)) {
                     const esAdmin = esMensajeMio || NUMEROS_ADMIN.includes(idRemitente) || idRemitente === MI_CHAT_PERSONAL;
-
-                    if (!esAdmin) {
-                        console.log(`⚠️ Intento no autorizado de ejecutar comando desde: +${numeroReal}`);
-                        continue;
-                    }
-
-                    console.log(`⚙️ [ADMIN] Comando ejecutado: "${userMessage}"`);
+                    if (!esAdmin) continue;
 
                     const responderPrivado = async (texto) => {
                         try {
@@ -517,13 +510,7 @@ async function iniciarBot() {
                     };
 
                     if (mensajeLower === '!admin' || mensajeLower === '!help') {
-                        const menuHelp = `🛠️ *MENÚ DE COMANDOS DE ADMINISTRACIÓN*\n\n` +
-                            `• *!horario off* : Desactiva el filtro de horario (24/7).\n` +
-                            `• *!horario on* : Activa el filtro de horario laboral.\n` +
-                            `• *!horario status* : Ver estado actual del filtro.\n` +
-                            `• *!unpause* : Reactiva el bot en el chat actual.\n` +
-                            `• *!unpause all* : Reactiva el bot en TODOS los chats.`;
-                        await responderPrivado(menuHelp);
+                        await responderPrivado(`🛠️ *MENÚ ADMIN*\n\n• *!horario off*\n• *!horario on*\n• *!horario status*\n• *!unpause*\n• *!unpause all*`);
                         continue;
                     }
 
@@ -531,9 +518,9 @@ async function iniciarBot() {
                         if (chatsPausados[idRemitente]) {
                             delete chatsPausados[idRemitente];
                             guardarPausas();
-                            await responderPrivado(`⚙️ *ADMIN:* Bot reactivado para el chat de +${numeroReal}.`);
+                            await responderPrivado(`⚙️ Bot reactivado para +${numeroReal}.`);
                         } else {
-                            await responderPrivado(`⚙️ *ADMIN:* El chat de +${numeroReal} no estaba pausado.`);
+                            await responderPrivado(`⚙️ El chat no estaba pausado.`);
                         }
                         continue;
                     }
@@ -541,25 +528,24 @@ async function iniciarBot() {
                     if (mensajeLower === '!unpause all' || mensajeLower === '!despausar todo') {
                         chatsPausados = {};
                         guardarPausas();
-                        await responderPrivado('⚙️ *ADMIN:* Se reactivó el bot en TODOS los chats pausados.');
+                        await responderPrivado('⚙️ Todos los chats despausados.');
                         continue;
                     }
 
                     if (mensajeLower === '!horario off' || mensajeLower === '!horario false' || mensajeLower === '!horario 0') {
                         ignorarHorario = true;
-                        await responderPrivado('⚙️ *ADMIN:* Modo de prueba activado (Filtro de horario DESACTIVADO).');
+                        await responderPrivado('⚙️ Filtro de horario DESACTIVADO (24/7).');
                         continue;
                     }
 
                     if (mensajeLower === '!horario on' || mensajeLower === '!horario true' || mensajeLower === '!horario 1') {
                         ignorarHorario = false;
-                        await responderPrivado('⚙️ *ADMIN:* Modo normal activado (Filtro de horario ACTIVADO).');
+                        await responderPrivado('⚙️ Filtro de horario ACTIVADO.');
                         continue;
                     }
 
                     if (mensajeLower === '!horario status') {
-                        const estado = ignorarHorario ? 'DESACTIVADO (Responde 24/7)' : 'ACTIVADO (Respeta horario)';
-                        await responderPrivado(`⚙️ *ADMIN:* Estado del filtro de horario: ${estado}`);
+                        await responderPrivado(`⚙️ Estado del horario: ${ignorarHorario ? '24/7' : 'Normal'}`);
                         continue;
                     }
                 }
@@ -569,30 +555,25 @@ async function iniciarBot() {
 
                 // Anti-Spam
                 const ahora = Date.now();
-                if (!registroSpam[idRemitente]) {
-                    registroSpam[idRemitente] = [];
-                }
-                
+                if (!registroSpam[idRemitente]) registroSpam[idRemitente] = [];
                 registroSpam[idRemitente] = registroSpam[idRemitente].filter(ts => ahora - ts < 10000);
                 registroSpam[idRemitente].push(ahora);
 
                 if (registroSpam[idRemitente].length > 4) {
                     chatsPausados[idRemitente] = ahora + (5 * 60 * 1000);
                     guardarPausas();
-                    await sock.sendMessage(MI_CHAT_PERSONAL, { text: `⚠️ *ALERTA ANTI-SPAM:* Se pausó el chat de +${numeroReal}.` });
+                    await sock.sendMessage(MI_CHAT_PERSONAL, { text: `⚠️ *ANTI-SPAM:* Chat de +${numeroReal} pausado.` });
                     continue;
                 }
 
-                // Archivos multimedia o audios
                 const tipoMsg = Object.keys(msg.message)[0];
                 if (tipoMsg !== 'conversation' && tipoMsg !== 'extendedTextMessage') {
-                    await sock.sendMessage(idRemitente, { text: '¡Hola! Por el momento solo puedo leer mensajes en texto. ¿En qué te puedo ayudar?' }, { quoted: msg });
+                    await sock.sendMessage(idRemitente, { text: '¡Hola! Por el momento solo puedo leer mensajes en texto.' }, { quoted: msg });
                     continue;
                 }
 
                 if (!userMessage) continue;
 
-                // PROCESAMIENTO CON LA API EN RENDER
                 agregarMensajeAHistorial(idRemitente, 'user', userMessage);
                 console.log(`[Mensaje Recibido] De: +${numeroReal} | Texto: "${userMessage}"`);
 
@@ -618,7 +599,7 @@ async function iniciarBot() {
                 );
 
                 if (response.status === 200) {
-                    let replyText = response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.';
+                    let replyText = response.data.reply || response.data.message || response.data.response || 'Sin respuesta.';
 
                     if (replyText.includes('[TRANSFERIR_HUMANO]')) {
                         const regex = /\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i;
@@ -632,12 +613,12 @@ async function iniciarBot() {
                             pregunta = match[2].trim();
                         }
 
-                        const mensajeNotificacionAdmin = `🚨 *SOLICITUD DE ASESOR HUMANO*\n\n📱 *Cliente:* +${numeroReal}\n📋 *Resumen:* ${resumen}\n❓ *Consulta:* ${pregunta}`;
-                        await sock.sendMessage(MI_CHAT_PERSONAL, { text: mensajeNotificacionAdmin });
+                        const mensajeAdmin = `🚨 *ASESOR HUMANO*\n\n📱 *Cliente:* +${numeroReal}\n📋 *Resumen:* ${resumen}\n❓ *Consulta:* ${pregunta}`;
+                        await sock.sendMessage(MI_CHAT_PERSONAL, { text: mensajeAdmin });
 
                         replyText = replyText.replace(/\[TRANSFERIR_HUMANO\][\s\S]*?\[\/TRANSFERIR_HUMANO\]/gi, '').trim();
                         if (!replyText) {
-                            replyText = "Claro que sí, con gusto. Le acabo de notificar a uno de nuestros asesores para que tome tu caso personalmente en breve.";
+                            replyText = "Claro que sí, un asesor tomará tu caso en breve.";
                         }
 
                         chatsPausados[idRemitente] = Date.now() + (4 * 60 * 60 * 1000);
@@ -648,15 +629,11 @@ async function iniciarBot() {
                     await sock.sendMessage(idRemitente, { text: replyText }, { quoted: msg });
 
                 } else {
-                    console.log('--- ERROR HTTP DETECTADO EN RENDER ---', response.status);
-                    await sock.sendMessage(idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
+                    await sock.sendMessage(idRemitente, { text: 'Ocurrió un error temporal en el servidor. Intenta de nuevo.' }, { quoted: msg });
                 }
 
             } catch (error) {
-                console.error('====================================');
-                console.error('   DETALLE DEL ERROR DE RED/AXIOS   ');
-                console.error(error?.message || error);
-                console.error('====================================');
+                console.error('Error procesando mensaje:', error?.message || error);
             }
         }
     });
