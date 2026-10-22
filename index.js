@@ -404,6 +404,18 @@ async function procesarMensaje(sock, msg) {
         try {
             const cuerpo = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
             console.log('Detalle del error de la API:', String(cuerpo).slice(0, 800));
+            // Las cabeceras dicen QUIÉN respondió el error (tu API, Cloudflare/Render u otro)
+            const h = response.headers || {};
+            console.log('Cabeceras de la API:', JSON.stringify({
+                server: h['server'],
+                poweredBy: h['x-powered-by'],
+                retryAfter: h['retry-after'],
+                renderOrigin: h['x-render-origin-server'],
+                rndrId: h['rndr-id'],
+                cfRay: h['cf-ray'],
+                contentType: h['content-type']
+            }));
+            console.log('Tamaño del prompt enviado (caracteres):', String(PROMPT_SISTEMA_AVI).length);
         } catch (e) {}
         await enviar(sock, idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
         return;
