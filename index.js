@@ -270,7 +270,7 @@ Cada proyecto debe adaptarse al negocio, su público y sus objetivos.
 5. DIFERENCIADOR PRINCIPAL
 El principal diferencial de Scroll Studios es:
 personalización + diseño + estrategia + desarrollo + experiencia de usuario + automatización + IA cuando realmente aporta valor.
-No afirmes que Scroll is "la mejor agencia", "la número uno", "la más barata" o cualquier otro superlativo que no pueda demostrarse.
+No afirmes que Scroll es "la mejor agencia", "la número uno", "la más barata" o cualquier otro superlativo que no pueda demostrarse.
 No inventes premios, clientes, testimonios, estadísticas ni resultados.
 La propuesta debe transmitir:
 "No hacemos simplemente una página web. Desarrollamos una solución digital adaptada a lo que tu negocio necesita."
@@ -406,7 +406,7 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 4. INICIALIZACIÓN DE BAILEYS (CON FALLBACK DE VERSIÓN Y CONEXIÓN ROBUSTA)
+// 4. INICIALIZACIÓN DE BAILEYS (CONEXIÓN ROBUSTA Y ANTI-BLOQUEO RENDER)
 // =========================================================================
 async function iniciarBot() {
     console.log('🚀 Iniciando motor de Baileys...');
@@ -420,7 +420,7 @@ async function iniciarBot() {
             version = fetchedVersion.version;
         }
     } catch (e) {
-        console.log('⚠️ No se pudo obtener la versión más reciente. Usando fallback.');
+        console.log('⚠️ Usando versión fallback de Baileys.');
     }
 
     const sock = makeWASocket({
@@ -430,9 +430,9 @@ async function iniciarBot() {
         logger: pino({ level: 'silent' }),
         browser: ['Ubuntu', 'Chrome', '120.0.6099.109'],
         connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: undefined,
-        keepAliveIntervalMs: 25000,
-        emitOwnEvents: true
+        retryRequestDelayMs: 5000,
+        markOnlineOnConnect: true,
+        fireInitQueries: true
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -454,7 +454,7 @@ async function iniciarBot() {
             console.log(`⚠️ Conexión cerrada (Código: ${statusCode || 'Desconocido'}). ¿Reconectar?: ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                setTimeout(iniciarBot, 5000);
+                setTimeout(iniciarBot, 8000);
             } else {
                 console.log('❌ Sesión cerrada permanentemente. Limpiando carpeta session-baileys...');
                 try {
@@ -463,9 +463,9 @@ async function iniciarBot() {
                 setTimeout(iniciarBot, 5000);
             }
         } else if (connection === 'open') {
-            latestQR = ''; // Limpiamos el QR al conectar con éxito
+            latestQR = ''; 
             console.log(`\n==============================================`);
-            console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp (Baileys).`);
+            console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp.`);
             console.log(`==============================================\n`);
         }
     });
