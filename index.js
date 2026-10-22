@@ -424,7 +424,7 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (ESTABLE Y PERSISTENTE)
+// 5. INICIALIZACIÓN DE WHATSAPP (ESTABLE Y SIN ARGUMENTOS CONFLICTIVOS)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
@@ -440,10 +440,7 @@ const client = new Client({
             '--disable-accelerated-2d-canvas',
             '--no-gpu',
             '--disable-software-rasterizer',
-            '--disable-extensions',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu-sandbox'
+            '--disable-extensions'
         ]
     }
 });
