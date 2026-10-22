@@ -424,7 +424,7 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP (CON CHROME DEL SISTEMA / DOCKER)
+// 5. INICIALIZACIÓN DE WHATSAPP (DOCKER OPTIMIZADO)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
@@ -436,9 +436,9 @@ const client = new Client({
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu'
+            '--no-gpu',
+            '--disable-software-rasterizer',
+            '--disable-extensions'
         ]
     }
 });
