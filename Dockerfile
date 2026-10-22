@@ -1,6 +1,6 @@
 FROM node:18-bookworm
 
-# Instalamos Chromium y dependencias del sistema de forma limpia
+# Instalamos Chromium, libgbm1 y dependencias del sistema de forma limpia
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     libxdamage1 \
     libxrandr2 \
     xdg-utils \
+    libgbm1 \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
