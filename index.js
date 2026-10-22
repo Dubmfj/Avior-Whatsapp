@@ -34,6 +34,58 @@ const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || '').replace(/\D/g, ''); //
 
 const API_URL = 'https://avior-ai.onrender.com/api/chat-wsp';
 
+// CAMBIO 14: llamada DIRECTA a Gemini (sin pasar por avior-ai).
+// El 429 venía del borde de Render/Cloudflare, no de tu API ni de Gemini: la petición
+// bot -> URL pública de avior-ai ni siquiera llegaba a Express. Si defines GEMINI_API_KEY
+// en este servicio, el bot habla directo con Gemini; si no, usa la API de antes.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash'; // el mismo que usa tu server.js
+
+let clienteGemini = null;
+async function obtenerGemini() {
+    if (!GEMINI_API_KEY) return null;
+    if (!clienteGemini) {
+        try {
+            const { GoogleGenAI } = await import('@google/genai');
+            clienteGemini = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+        } catch (e) {
+            console.error('❌ No se pudo cargar @google/genai (¿falta npm install @google/genai?). Usando la API:', e?.message || e);
+            return null;
+        }
+    }
+    return clienteGemini;
+}
+
+// El historial ya incluye el último mensaje del cliente. Gemini recibe todo el hilo,
+// así Avi recuerda la conversación (la API anterior solo mandaba el último mensaje).
+async function generarConGemini(gemini, historial) {
+    const contents = historial.map((m) => ({
+        role: m.role === 'model' ? 'model' : 'user',
+        parts: [{ text: String(m.content ?? '') }]
+    }));
+    while (contents.length && contents[0].role !== 'user') contents.shift(); // debe empezar con el cliente
+
+    const intentosMax = 3;
+    for (let i = 0; i < intentosMax; i++) {
+        try {
+            const respuesta = await gemini.models.generateContent({
+                model: GEMINI_MODEL,
+                contents,
+                config: { systemInstruction: PROMPT_SISTEMA_AVI }
+            });
+            return String(respuesta.text || '').trim();
+        } catch (error) {
+            const reintentable = error?.status === 503 || error?.status === 429;
+            if (reintentable && i < intentosMax - 1) {
+                console.warn(`[Gemini ${error.status}] reintentando (${i + 1}/${intentosMax})...`);
+                await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+                continue;
+            }
+            throw error;
+        }
+    }
+}
+
 // Números externos autorizados para ejecutar comandos admin (opcional)
 const NUMEROS_ADMIN = [];
 
@@ -381,6 +433,19 @@ async function procesarMensaje(sock, msg) {
 
     try { await sock.sendPresenceUpdate('composing', idRemitente); } catch (e) {}
 
+    let replyText;
+
+    const gemini = await obtenerGemini();
+    if (gemini) {
+        try {
+            replyText = await generarConGemini(gemini, historialesChats[idRemitente] || []);
+            if (!replyText) replyText = 'Sin respuesta válida del servidor.';
+        } catch (error) {
+            console.error('--- ERROR EN GEMINI DIRECTO ---', error?.status || '', error?.message || error);
+            await enviar(sock, idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
+            return;
+        }
+    } else {
     const response = await axios.post(
         API_URL,
         {
@@ -421,9 +486,10 @@ async function procesarMensaje(sock, msg) {
         return;
     }
 
-    let replyText = String(
+    replyText = String(
         response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.'
     );
+    } // fin del modo "API de avior-ai"
 
     if (replyText.includes('[TRANSFERIR_HUMANO]')) {
         const regex = /\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i;
