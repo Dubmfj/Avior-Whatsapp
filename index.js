@@ -3,7 +3,7 @@ const {
     DisconnectReason,
     fetchLatestBaileysVersion,
     Browsers,
-    makeCacheableSignalKeyStore          // CAMBIO 1: cache de claves Signal (menos lecturas, menos carreras)
+    makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const axios = require('axios');
@@ -11,35 +11,31 @@ const http = require('http');
 const QRCode = require('qrcode');
 const qrcodeTerminal = require('qrcode-terminal');
 const PROMPT_SISTEMA_AVI = require('./prompt-avi');
-// CAMBIO 2: módulo nuevo con auth en Postgres, bloqueo de instancia única y almacén clave/valor
 const {
     crearPool,
     adquirirBloqueo,
     usePostgresAuthState,
     kvGet,
-    kvSet
+    kvSet,
+    descartarPendiente
 } = require('./auth-postgres');
+// NUEVO: controla cuándo Neon está habilitado y cada cuánto se guardan los cambios
+const dbVentana = require('./db-ventana');
 
 // =========================================================================
 // 0. CONFIGURACIÓN (variables de entorno opcionales en Render)
 // =========================================================================
 const PORT = process.env.PORT || 10000;
-const QR_TOKEN = process.env.QR_TOKEN || '';          // clave para ver el QR: /qr?key=TU_CLAVE
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';    // pon 'silent' cuando todo ande bien
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || ''; // Render lo define solo
-const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || '').replace(/\D/g, ''); // ej: 51987355501 (vincular con código en vez de QR)
-
-// CAMBIO 3: ya no hay SESSION_DIR / PAUSAS_FILE / HISTORIALES_FILE.
-// En Render el disco se borra en cada deploy; todo vive en Postgres (DATABASE_URL).
+const QR_TOKEN = process.env.QR_TOKEN || '';
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
+const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || '').replace(/\D/g, '');
 
 const API_URL = 'https://avior-ai.onrender.com/api/chat-wsp';
 
-// CAMBIO 14: llamada DIRECTA a Gemini (sin pasar por avior-ai).
-// El 429 venía del borde de Render/Cloudflare, no de tu API ni de Gemini: la petición
-// bot -> URL pública de avior-ai ni siquiera llegaba a Express. Si defines GEMINI_API_KEY
-// en este servicio, el bot habla directo con Gemini; si no, usa la API de antes.
+// Llamada DIRECTA a Gemini (sin pasar por avior-ai)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash'; // el mismo que usa tu server.js
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 
 let clienteGemini = null;
 async function obtenerGemini() {
@@ -56,14 +52,12 @@ async function obtenerGemini() {
     return clienteGemini;
 }
 
-// El historial ya incluye el último mensaje del cliente. Gemini recibe todo el hilo,
-// así Avi recuerda la conversación (la API anterior solo mandaba el último mensaje).
 async function generarConGemini(gemini, historial) {
     const contents = historial.map((m) => ({
         role: m.role === 'model' ? 'model' : 'user',
         parts: [{ text: String(m.content ?? '') }]
     }));
-    while (contents.length && contents[0].role !== 'user') contents.shift(); // debe empezar con el cliente
+    while (contents.length && contents[0].role !== 'user') contents.shift();
 
     const intentosMax = 3;
     for (let i = 0; i < intentosMax; i++) {
@@ -102,24 +96,21 @@ let latestQR = '';
 let latestPairingCode = '';
 let conectado = false;
 
-// CAMBIO 4: recursos compartidos de la nueva arquitectura
-let pool = null;          // conexión a Postgres
-let lockClient = null;    // conexión que mantiene el bloqueo de instancia única
-let authActual = null;    // auth state actual (para poder borrarlo en loggedOut)
-let apagando = false;     // true mientras Render nos apaga (evita reconectar)
+let pool = null;
+let lockClient = null;
+let authActual = null;
+let apagando = false;
 
-// IDs de mensajes enviados por el propio bot (para no confundirlos con intervención humana)
 const mensajesDelBot = new Set();
-
-// CAMBIO 5: copia de los mensajes enviados; Baileys la pide en getMessage para reenviar
-// cuando el cliente solicita un reintento (evita parte de los "Esperando el mensaje")
 const mensajesEnviados = new Map();
 
 const COMANDOS_ADMIN = [
-    '!horario off', '!horario false', '!horario 0',
-    '!horario on', '!horario true', '!horario 1',
-    '!horario status', '!unpause', '!despausar',
-    '!unpause all', '!despausar todo', '!admin', '!help'
+    '!unpause', '!despausar',
+    '!unpause all', '!despausar todo', '!admin', '!help',
+    // Control del bot (horario automático 22:00-06:30)
+    '!bot on', '!bot off', '!bot auto', '!bot status',
+    // NUEVO: control de la base de datos Neon
+    '!db on', '!db off', '!db auto', '!db status', '!db flush'
 ];
 
 // =========================================================================
@@ -148,7 +139,6 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (latestQR) {
-            // El QR se genera aquí mismo: no se envía a ningún servicio externo
             const dataUrl = await QRCode.toDataURL(latestQR, { width: 300, margin: 1 });
             return res.end(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Avi WhatsApp - Escanear QR</title>
@@ -178,7 +168,7 @@ server.listen(PORT, () => {
     console.log(`🌐 Servidor HTTP activo en el puerto ${PORT}`);
 });
 
-// Auto-ping para que Render free no duerma el servicio (complementa a UptimeRobot)
+// Auto-ping para que Render free no duerma el servicio (no toca la base de datos)
 if (SELF_URL) {
     setInterval(() => {
         axios.get(SELF_URL, { timeout: 15000 }).catch(() => {});
@@ -186,7 +176,8 @@ if (SELF_URL) {
 }
 
 // =========================================================================
-// 2. PERSISTENCIA (PAUSAS E HISTORIAL) — CAMBIO 6: ahora en Postgres
+// 2. PERSISTENCIA (PAUSAS E HISTORIAL)
+//    kvSet ahora solo escribe en memoria; db-ventana.js lo guarda en lote.
 // =========================================================================
 async function cargarMemoria() {
     try {
@@ -217,44 +208,33 @@ function agregarMensajeAHistorial(userId, rol, texto) {
     guardarHistoriales();
 }
 
-// (la carga ahora se hace en main(), después de conectar a Postgres)
+// =========================================================================
+// 3. HORARIO DEL BOT (PERÚ - UTC-5): automático SOLO de 10:00 PM a 6:30 AM
+//    Fuera de ese horario el bot está apagado, salvo que lo actives con !bot on
+// =========================================================================
+const BOT_INICIO_MIN = 22 * 60;       // 10:00 PM
+const BOT_FIN_MIN = 6 * 60 + 30;      // 6:30 AM
 
-// =========================================================================
-// 3. HORARIOS (PERÚ - UTC-5)
-// =========================================================================
 function esHorarioDeBot() {
-    if (ignorarHorario) return true;
+    if (ignorarHorario) return true;   // activado a mano con !bot on
 
     const partes = new Intl.DateTimeFormat('en-US', {
         timeZone: 'America/Lima',
         hourCycle: 'h23',
-        weekday: 'short',
         hour: 'numeric',
         minute: 'numeric'
     }).formatToParts(new Date());
 
-    let diaSemanaStr = '';
     let hora = 0;
     let minutos = 0;
-
     for (const part of partes) {
-        if (part.type === 'weekday') diaSemanaStr = part.value;
         if (part.type === 'hour') hora = parseInt(part.value, 10) % 24;
         if (part.type === 'minute') minutos = parseInt(part.value, 10);
     }
-
-    const diasMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-    const diaSemana = diasMap[diaSemanaStr] ?? new Date().getDay();
     const minutosTotales = hora * 60 + minutos;
-    const esJuevesOSabado = (diaSemana === 4 || diaSemana === 6);
 
-    // Bloque 1: 11:00 PM a 2:00 PM
-    if (minutosTotales >= 23 * 60 || minutosTotales < 14 * 60) return true;
-
-    // Bloque 2: Jueves y Sábados 7:00 PM a 11:00 PM
-    if (esJuevesOSabado && minutosTotales >= 19 * 60 && minutosTotales < 23 * 60) return true;
-
-    return false;
+    // Cruza la medianoche: 22:00 -> 24:00 y 00:00 -> 06:30
+    return minutosTotales >= BOT_INICIO_MIN || minutosTotales < BOT_FIN_MIN;
 }
 
 function estaChatPausado(chatId) {
@@ -278,7 +258,6 @@ async function enviar(sock, jid, contenido, opciones) {
         if (mensajesDelBot.size > 500) {
             mensajesDelBot.delete(mensajesDelBot.values().next().value);
         }
-        // CAMBIO 5 (cont.): guardamos el contenido para getMessage
         if (enviado.message) {
             mensajesEnviados.set(id, enviado.message);
             if (mensajesEnviados.size > 1000) {
@@ -303,14 +282,43 @@ function extraerTexto(msg) {
 async function ejecutarComando(sock, comando, chatId, numeroReal) {
     const responder = (texto) => enviar(sock, MI_CHAT_PERSONAL, { text: texto });
 
+    // Control del bot: !bot on = lo activas a mano (24/7, y Neon habilitado)
+    //                  !bot off / !bot auto = vuelve al horario automático 22:00-06:30
+    if (comando === '!bot on') {
+        ignorarHorario = true;
+        await dbVentana.comando('!db on');
+        return responder('✅ *BOT ACTIVADO A MANO.* Responde 24/7 y Neon queda habilitado.\nCuando termines escribe *!bot off* para volver al horario (10 PM - 6:30 AM).');
+    }
+    if (comando === '!bot off' || comando === '!bot auto') {
+        ignorarHorario = false;
+        const msg = await dbVentana.comando('!db auto');
+        return responder('🌙 *BOT EN AUTOMÁTICO.* Solo responde de 10:00 PM a 6:30 AM; fuera de ese horario queda apagado.\n' + msg);
+    }
+    if (comando === '!bot status') {
+        const dentro = (() => { const o = ignorarHorario; ignorarHorario = false; const r = esHorarioDeBot(); ignorarHorario = o; return r; })();
+        return responder(`🤖 *BOT:* ${ignorarHorario ? 'ACTIVADO A MANO (24/7)' : 'AUTOMÁTICO (10 PM - 6:30 AM)'}\n• Ahora mismo: ${esHorarioDeBot() ? 'RESPONDIENDO' : 'APAGADO'}\n• ¿Dentro del horario? ${dentro ? 'sí' : 'no'}`);
+    }
+
+    // Comandos de la base de datos Neon
+    if (comando.startsWith('!db ')) {
+        return responder(await dbVentana.comando(comando));
+    }
+
     if (comando === '!admin' || comando === '!help') {
         return responder(
             `🛠️ *MENÚ DE COMANDOS DE ADMINISTRACIÓN*\n\n` +
-            `• *!horario off* : Desactiva el filtro de horario (24/7).\n` +
-            `• *!horario on* : Activa el filtro de horario laboral.\n` +
-            `• *!horario status* : Ver estado actual del filtro.\n` +
+            `🤖 *BOT (automático 10 PM - 6:30 AM)*\n` +
+            `• *!bot on* : Lo activas a mano (24/7 + Neon habilitado).\n` +
+            `• *!bot off* : Vuelve al horario automático (fuera de horario, apagado).\n` +
+            `• *!bot status* : Ver si está respondiendo.\n\n` +
             `• *!unpause* : Reactiva el bot (escríbelo DENTRO del chat del cliente).\n` +
-            `• *!unpause all* : Reactiva el bot en TODOS los chats.`
+            `• *!unpause all* : Reactiva el bot en TODOS los chats.\n\n` +
+            `🗄️ *BASE DE DATOS (Neon)*\n` +
+            `• *!db on* : Habilita Neon ya (hasta que pongas !db auto).\n` +
+            `• *!db auto* : Neon vuelve a su horario (22:00-06:30).\n` +
+            `• *!db off* : Fuerza Neon apagado.\n` +
+            `• *!db flush* : Guarda ahora los cambios pendientes.\n` +
+            `• *!db status* : Ver estado de la base de datos.`
         );
     }
 
@@ -331,21 +339,6 @@ async function ejecutarComando(sock, comando, chatId, numeroReal) {
         guardarPausas();
         return responder('⚙️ *ADMIN:* Se reactivó el bot en TODOS los chats pausados.');
     }
-
-    if (['!horario off', '!horario false', '!horario 0'].includes(comando)) {
-        ignorarHorario = true;
-        return responder('⚙️ *ADMIN:* Modo de prueba activado (filtro de horario DESACTIVADO).');
-    }
-
-    if (['!horario on', '!horario true', '!horario 1'].includes(comando)) {
-        ignorarHorario = false;
-        return responder('⚙️ *ADMIN:* Modo normal activado (filtro de horario ACTIVADO).');
-    }
-
-    if (comando === '!horario status') {
-        const estado = ignorarHorario ? 'DESACTIVADO (responde 24/7)' : 'ACTIVADO (respeta horario)';
-        return responder(`⚙️ *ADMIN:* Estado del filtro de horario: ${estado}`);
-    }
 }
 
 // =========================================================================
@@ -362,11 +355,8 @@ async function procesarMensaje(sock, msg) {
         idRemitente.endsWith('@newsletter')
     ) return;
 
-    // Ignora lo que envió el propio bot
     if (msg.key.id && mensajesDelBot.has(msg.key.id)) return;
 
-    // CAMBIO 12: ignora mensajes técnicos de WhatsApp (sincronización de historial, claves,
-    // reacciones). Antes contaban como "intervención humana" y pausaban chats sin motivo.
     const tiposTecnicos = [
         'protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage',
         'messageContextInfo', 'pollUpdateMessage', 'keepInChatMessage'
@@ -446,50 +436,48 @@ async function procesarMensaje(sock, msg) {
             return;
         }
     } else {
-    const response = await axios.post(
-        API_URL,
-        {
-            systemInstruction: PROMPT_SISTEMA_AVI,
-            message: userMessage,
-            prompt: userMessage,
-            userId: idRemitente,
-            history: historialesChats[idRemitente] || [],
-            maxTokens: 150
-        },
-        {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 120000,
-            validateStatus: (status) => status >= 200 && status < 600
+        const response = await axios.post(
+            API_URL,
+            {
+                systemInstruction: PROMPT_SISTEMA_AVI,
+                message: userMessage,
+                prompt: userMessage,
+                userId: idRemitente,
+                history: historialesChats[idRemitente] || [],
+                maxTokens: 150
+            },
+            {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 120000,
+                validateStatus: (status) => status >= 200 && status < 600
+            }
+        );
+
+        if (response.status !== 200) {
+            console.log('--- ERROR HTTP DETECTADO EN API ---', response.status);
+            try {
+                const cuerpo = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+                console.log('Detalle del error de la API:', String(cuerpo).slice(0, 800));
+                const h = response.headers || {};
+                console.log('Cabeceras de la API:', JSON.stringify({
+                    server: h['server'],
+                    poweredBy: h['x-powered-by'],
+                    retryAfter: h['retry-after'],
+                    renderOrigin: h['x-render-origin-server'],
+                    rndrId: h['rndr-id'],
+                    cfRay: h['cf-ray'],
+                    contentType: h['content-type']
+                }));
+                console.log('Tamaño del prompt enviado (caracteres):', String(PROMPT_SISTEMA_AVI).length);
+            } catch (e) {}
+            await enviar(sock, idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
+            return;
         }
-    );
 
-    if (response.status !== 200) {
-        console.log('--- ERROR HTTP DETECTADO EN API ---', response.status);
-        // CAMBIO 13: muestra el cuerpo del error para saber la causa real (cuota, límite, etc.)
-        try {
-            const cuerpo = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-            console.log('Detalle del error de la API:', String(cuerpo).slice(0, 800));
-            // Las cabeceras dicen QUIÉN respondió el error (tu API, Cloudflare/Render u otro)
-            const h = response.headers || {};
-            console.log('Cabeceras de la API:', JSON.stringify({
-                server: h['server'],
-                poweredBy: h['x-powered-by'],
-                retryAfter: h['retry-after'],
-                renderOrigin: h['x-render-origin-server'],
-                rndrId: h['rndr-id'],
-                cfRay: h['cf-ray'],
-                contentType: h['content-type']
-            }));
-            console.log('Tamaño del prompt enviado (caracteres):', String(PROMPT_SISTEMA_AVI).length);
-        } catch (e) {}
-        await enviar(sock, idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
-        return;
+        replyText = String(
+            response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.'
+        );
     }
-
-    replyText = String(
-        response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.'
-    );
-    } // fin del modo "API de avior-ai"
 
     if (replyText.includes('[TRANSFERIR_HUMANO]')) {
         const regex = /\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i;
@@ -527,7 +515,6 @@ let reconexionProgramada = false;
 let intentos = 0;
 
 function programarReconexion(ms) {
-    // CAMBIO 7: si Render nos está apagando, no reconectar
     if (reconexionProgramada || apagando) return;
     reconexionProgramada = true;
     console.log(`🔁 Reintentando en ${Math.round(ms / 1000)}s...`);
@@ -552,11 +539,10 @@ async function iniciarBot() {
     console.log('🚀 Iniciando motor de Baileys...');
     cerrarSocketAnterior();
 
-    // CAMBIO 8: las claves y credenciales se leen/escriben en Postgres, no en archivos
+    // Carga la sesión UNA vez (en reconexiones reutiliza la memoria, no vuelve a leer Neon)
     authActual = await usePostgresAuthState(pool, 'avi');
     const { state, saveCreds } = authActual;
 
-    // Pide la versión ACTUAL de WhatsApp Web (versiones viejas = cierre inmediato)
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`📡 Versión WhatsApp Web: ${version.join('.')} (última: ${isLatest})`);
 
@@ -564,7 +550,6 @@ async function iniciarBot() {
 
     const sock = makeWASocket({
         version,
-        // CAMBIO 1 (cont.): claves envueltas en caché
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger)
@@ -573,7 +558,6 @@ async function iniciarBot() {
         browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
-        // CAMBIO 5 (cont.): permite reenviar mensajes cuando el cliente pide reintento
         getMessage: async (key) => mensajesEnviados.get(key.id),
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: undefined,
@@ -590,7 +574,6 @@ async function iniciarBot() {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // Modo código de vinculación (más cómodo que el QR en Render)
         if (qr && PAIRING_NUMBER && !state.creds.registered && !codigoSolicitado) {
             codigoSolicitado = true;
             try {
@@ -622,7 +605,6 @@ async function iniciarBot() {
             console.log(`⚠️ Conexión cerrada | código: ${statusCode ?? 'sin código'} | motivo: ${error?.message || error || 'desconocido'}`);
 
             if (statusCode === DisconnectReason.loggedOut) {
-                // CAMBIO 9: se borra la sesión de la base de datos (antes: la carpeta)
                 console.log('❌ Sesión cerrada desde el celular. Limpiando sesión en la base de datos...');
                 try { await authActual.clearAll(); } catch (e) {
                     console.error('No se pudo limpiar la sesión:', e?.message || e);
@@ -634,15 +616,13 @@ async function iniciarBot() {
             }
 
             if (statusCode === DisconnectReason.connectionReplaced) {
-                // CAMBIO 10: otra conexión usa estas mismas claves. Esta instancia se retira
-                // (NO reintenta): reconectar patearía a la otra y se pelearían por la sesión.
-                // Render la reinicia y, al arrancar, espera hasta que la sesión quede libre.
+                // Otra instancia tomó la sesión: NO guardar nuestras claves (pisarían las suyas)
                 console.error('⚠️ Otra conexión tomó la sesión. Cerrando esta instancia para no pelear por ella.');
+                descartarPendiente();
                 return apagar(1);
             }
 
             if (statusCode === DisconnectReason.restartRequired) {
-                // Normal justo después de escanear el QR
                 return programarReconexion(1000);
             }
 
@@ -676,34 +656,42 @@ async function iniciarBot() {
     });
 }
 
-// Que un error suelto no tumbe el proceso
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e?.message || e));
 process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.message || e));
 
 // =========================================================================
-// 8. ARRANQUE Y APAGADO ORDENADO — CAMBIO 11
+// 8. ARRANQUE Y APAGADO ORDENADO
 // =========================================================================
 async function main() {
     pool = crearPool();
-    // Espera aquí hasta que la instancia vieja de Render suelte la sesión de WhatsApp
+    // 1) Habilita Neon, programa los guardados y el apagado nocturno/diurno.
+    //    Mientras WhatsApp no esté vinculado, mantiene Neon habilitado.
+    await dbVentana.arrancar(pool, {
+        forzarSi: () => Boolean(authActual && !authActual.registrado())
+    });
+    // 2) Espera a que la instancia vieja suelte la sesión (usa Neon solo ahora)
     lockClient = await adquirirBloqueo(pool);
+    // 3) Carga pausas e historiales a memoria
     await cargarMemoria();
     if (GEMINI_API_KEY) {
         console.log(`🤖 Modo Gemini DIRECTO activo (modelo: ${GEMINI_MODEL}).`);
     } else {
         console.log('⚠️ GEMINI_API_KEY no está definida en este servicio: se usa la API de avior-ai (da 429). Agrégala en Environment.');
     }
+    // 4) Conecta WhatsApp
     await iniciarBot();
 }
 
 async function apagar(codigo) {
     // codigo === 1 => salida "con error" para que Render reinicie el servicio
-    // (las señales SIGTERM/SIGINT llegan aquí como texto, y eso cuenta como salida normal)
     if (apagando) return;
     apagando = true;
     console.log('🛑 Apagando de forma ordenada...');
     try { sockActual?.end(undefined); } catch (e) {}
-    await new Promise((r) => setTimeout(r, 1500)); // deja terminar escrituras pendientes
+    // Guarda en Neon todo lo pendiente (claves, pausas, historiales)
+    try { await dbVentana.alApagar(); } catch (e) {
+        console.error('No se pudo guardar al apagar:', e?.message || e);
+    }
     try { await lockClient?.liberar(); } catch (e) {}
     try { await pool?.end(); } catch (e) {}
     process.exit(codigo === 1 ? 1 : 0);
