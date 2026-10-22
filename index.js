@@ -1,32 +1,36 @@
 const {
     default: makeWASocket,
-    useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    Browsers
+    Browsers,
+    makeCacheableSignalKeyStore          // CAMBIO 1: cache de claves Signal (menos lecturas, menos carreras)
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 const http = require('http');
 const QRCode = require('qrcode');
 const qrcodeTerminal = require('qrcode-terminal');
 const PROMPT_SISTEMA_AVI = require('./prompt-avi');
+// CAMBIO 2: módulo nuevo con auth en Postgres, bloqueo de instancia única y almacén clave/valor
+const {
+    crearPool,
+    adquirirBloqueo,
+    usePostgresAuthState,
+    kvGet,
+    kvSet
+} = require('./auth-postgres');
 
 // =========================================================================
 // 0. CONFIGURACIÓN (variables de entorno opcionales en Render)
 // =========================================================================
 const PORT = process.env.PORT || 10000;
 const QR_TOKEN = process.env.QR_TOKEN || '';          // clave para ver el QR: /qr?key=TU_CLAVE
-const DATA_DIR = process.env.DATA_DIR || __dirname;   // si algún día usas disco persistente
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';    // pon 'silent' cuando todo ande bien
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || ''; // Render lo define solo
 const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || '').replace(/\D/g, ''); // ej: 51987355501 (vincular con código en vez de QR)
 
-const SESSION_DIR = path.join(DATA_DIR, 'session-baileys');
-const PAUSAS_FILE = path.join(DATA_DIR, 'pausas.json');
-const HISTORIALES_FILE = path.join(DATA_DIR, 'historiales.json');
+// CAMBIO 3: ya no hay SESSION_DIR / PAUSAS_FILE / HISTORIALES_FILE.
+// En Render el disco se borra en cada deploy; todo vive en Postgres (DATABASE_URL).
 
 const API_URL = 'https://avior-ai.onrender.com/api/chat-wsp';
 
@@ -46,8 +50,18 @@ let latestQR = '';
 let latestPairingCode = '';
 let conectado = false;
 
+// CAMBIO 4: recursos compartidos de la nueva arquitectura
+let pool = null;          // conexión a Postgres
+let lockClient = null;    // conexión que mantiene el bloqueo de instancia única
+let authActual = null;    // auth state actual (para poder borrarlo en loggedOut)
+let apagando = false;     // true mientras Render nos apaga (evita reconectar)
+
 // IDs de mensajes enviados por el propio bot (para no confundirlos con intervención humana)
 const mensajesDelBot = new Set();
+
+// CAMBIO 5: copia de los mensajes enviados; Baileys la pide en getMessage para reenviar
+// cuando el cliente solicita un reintento (evita parte de los "Esperando el mensaje")
+const mensajesEnviados = new Map();
 
 const COMANDOS_ADMIN = [
     '!horario off', '!horario false', '!horario 0',
@@ -120,37 +134,26 @@ if (SELF_URL) {
 }
 
 // =========================================================================
-// 2. PERSISTENCIA (PAUSAS E HISTORIAL)
+// 2. PERSISTENCIA (PAUSAS E HISTORIAL) — CAMBIO 6: ahora en Postgres
 // =========================================================================
-function cargarMemoria() {
+async function cargarMemoria() {
     try {
-        if (fs.existsSync(PAUSAS_FILE)) {
-            chatsPausados = JSON.parse(fs.readFileSync(PAUSAS_FILE, 'utf8')) || {};
-            console.log('📦 Pausas cargadas desde disco.');
-        }
-        if (fs.existsSync(HISTORIALES_FILE)) {
-            historialesChats = JSON.parse(fs.readFileSync(HISTORIALES_FILE, 'utf8')) || {};
-            console.log('📚 Historiales cargados desde disco.');
-        }
+        chatsPausados = (await kvGet(pool, 'pausas')) || {};
+        historialesChats = (await kvGet(pool, 'historiales')) || {};
+        console.log('📦 Pausas e historiales cargados desde Postgres.');
     } catch (e) {
         console.error('Error al cargar memoria:', e.message);
     }
 }
 
 function guardarPausas() {
-    try {
-        fs.writeFileSync(PAUSAS_FILE, JSON.stringify(chatsPausados, null, 2), 'utf8');
-    } catch (e) {
-        console.error('Error al guardar pausas:', e.message);
-    }
+    kvSet(pool, 'pausas', chatsPausados)
+        .catch((e) => console.error('Error al guardar pausas:', e.message));
 }
 
 function guardarHistoriales() {
-    try {
-        fs.writeFileSync(HISTORIALES_FILE, JSON.stringify(historialesChats, null, 2), 'utf8');
-    } catch (e) {
-        console.error('Error al guardar historiales:', e.message);
-    }
+    kvSet(pool, 'historiales', historialesChats)
+        .catch((e) => console.error('Error al guardar historiales:', e.message));
 }
 
 function agregarMensajeAHistorial(userId, rol, texto) {
@@ -162,7 +165,7 @@ function agregarMensajeAHistorial(userId, rol, texto) {
     guardarHistoriales();
 }
 
-cargarMemoria();
+// (la carga ahora se hace en main(), después de conectar a Postgres)
 
 // =========================================================================
 // 3. HORARIOS (PERÚ - UTC-5)
@@ -222,6 +225,13 @@ async function enviar(sock, jid, contenido, opciones) {
         mensajesDelBot.add(id);
         if (mensajesDelBot.size > 500) {
             mensajesDelBot.delete(mensajesDelBot.values().next().value);
+        }
+        // CAMBIO 5 (cont.): guardamos el contenido para getMessage
+        if (enviado.message) {
+            mensajesEnviados.set(id, enviado.message);
+            if (mensajesEnviados.size > 1000) {
+                mensajesEnviados.delete(mensajesEnviados.keys().next().value);
+            }
         }
     }
     return enviado;
@@ -425,7 +435,8 @@ let reconexionProgramada = false;
 let intentos = 0;
 
 function programarReconexion(ms) {
-    if (reconexionProgramada) return;
+    // CAMBIO 7: si Render nos está apagando, no reconectar
+    if (reconexionProgramada || apagando) return;
     reconexionProgramada = true;
     console.log(`🔁 Reintentando en ${Math.round(ms / 1000)}s...`);
     setTimeout(() => {
@@ -449,17 +460,29 @@ async function iniciarBot() {
     console.log('🚀 Iniciando motor de Baileys...');
     cerrarSocketAnterior();
 
-    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+    // CAMBIO 8: las claves y credenciales se leen/escriben en Postgres, no en archivos
+    authActual = await usePostgresAuthState(pool, 'avi');
+    const { state, saveCreds } = authActual;
 
     // Pide la versión ACTUAL de WhatsApp Web (versiones viejas = cierre inmediato)
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`📡 Versión WhatsApp Web: ${version.join('.')} (última: ${isLatest})`);
 
+    const logger = pino({ level: LOG_LEVEL });
+
     const sock = makeWASocket({
         version,
-        auth: state,
-        logger: pino({ level: LOG_LEVEL }),
+        // CAMBIO 1 (cont.): claves envueltas en caché
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, logger)
+        },
+        logger,
         browser: Browsers.ubuntu('Chrome'),
+        syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
+        // CAMBIO 5 (cont.): permite reenviar mensajes cuando el cliente pide reintento
+        getMessage: async (key) => mensajesEnviados.get(key.id),
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: undefined,
         keepAliveIntervalMs: 25000,
@@ -504,16 +527,25 @@ async function iniciarBot() {
             const error = lastDisconnect?.error;
             const statusCode = error?.output?.statusCode;
 
-            // 👇 AQUÍ ESTÁ EL DIAGNÓSTICO REAL
             console.log(`⚠️ Conexión cerrada | código: ${statusCode ?? 'sin código'} | motivo: ${error?.message || error || 'desconocido'}`);
 
             if (statusCode === DisconnectReason.loggedOut) {
-                console.log('❌ Sesión cerrada desde el celular. Limpiando sesión para pedir un QR nuevo...');
-                try { fs.rmSync(SESSION_DIR, { recursive: true, force: true }); } catch (e) {}
+                // CAMBIO 9: se borra la sesión de la base de datos (antes: la carpeta)
+                console.log('❌ Sesión cerrada desde el celular. Limpiando sesión en la base de datos...');
+                try { await authActual.clearAll(); } catch (e) {
+                    console.error('No se pudo limpiar la sesión:', e?.message || e);
+                }
                 latestQR = '';
                 latestPairingCode = '';
                 intentos = 0;
                 return programarReconexion(3000);
+            }
+
+            if (statusCode === DisconnectReason.connectionReplaced) {
+                // CAMBIO 10: otra conexión usa estas mismas claves. No reintentar en caliente
+                // (dos procesos peleándose por la sesión es lo que la corrompe).
+                console.error('⚠️ Sesión reemplazada por otra conexión. Esperando 60s antes de reintentar.');
+                return programarReconexion(60000);
             }
 
             if (statusCode === DisconnectReason.restartRequired) {
@@ -555,7 +587,31 @@ async function iniciarBot() {
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e?.message || e));
 process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.message || e));
 
-iniciarBot().catch((e) => {
-    console.error('❌ Error al iniciar el bot:', e?.message || e);
-    programarReconexion(5000);
+// =========================================================================
+// 8. ARRANQUE Y APAGADO ORDENADO — CAMBIO 11
+// =========================================================================
+async function main() {
+    pool = crearPool();
+    // Espera aquí hasta que la instancia vieja de Render suelte la sesión de WhatsApp
+    lockClient = await adquirirBloqueo();
+    await cargarMemoria();
+    await iniciarBot();
+}
+
+async function apagar() {
+    if (apagando) return;
+    apagando = true;
+    console.log('🛑 Apagando de forma ordenada...');
+    try { sockActual?.end(undefined); } catch (e) {}
+    await new Promise((r) => setTimeout(r, 1500)); // deja terminar escrituras pendientes
+    try { lockClient?.removeAllListeners('error'); await lockClient?.end(); } catch (e) {}
+    try { await pool?.end(); } catch (e) {}
+    process.exit(0);
+}
+process.on('SIGTERM', apagar);
+process.on('SIGINT', apagar);
+
+main().catch((e) => {
+    console.error('❌ Error fatal al iniciar:', e?.message || e);
+    process.exit(1);
 });
