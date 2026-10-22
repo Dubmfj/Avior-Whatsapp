@@ -420,9 +420,18 @@ client.on('ready', () => {
     console.log(`==============================================\n`);
 });
 
-client.on('disconnected', (reason) => {
-    console.log(`⚠️ Cliente desconectado. Razón: ${reason}. Reiniciando...`);
-    client.initialize();
+client.on('disconnected', async (reason) => {
+    console.log(`⚠️ Cliente desconectado. Razón: ${reason}. Limpiando instancia...`);
+    try {
+        await client.destroy();
+    } catch (err) {
+        console.error('Error al destruir el cliente previo:', err.message);
+    }
+    
+    setTimeout(() => {
+        console.log('🔄 Reiniciando cliente de WhatsApp...');
+        client.initialize();
+    }, 5000);
 });
 
 // =========================================================================
