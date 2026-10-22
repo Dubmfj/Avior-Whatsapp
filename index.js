@@ -556,10 +556,11 @@ async function iniciarBot() {
             }
 
             if (statusCode === DisconnectReason.connectionReplaced) {
-                // CAMBIO 10: otra conexión usa estas mismas claves. No reintentar en caliente
-                // (dos procesos peleándose por la sesión es lo que la corrompe).
-                console.error('⚠️ Sesión reemplazada por otra conexión. Esperando 60s antes de reintentar.');
-                return programarReconexion(60000);
+                // CAMBIO 10: otra conexión usa estas mismas claves. Esta instancia se retira
+                // (NO reintenta): reconectar patearía a la otra y se pelearían por la sesión.
+                // Render la reinicia y, al arrancar, espera hasta que la sesión quede libre.
+                console.error('⚠️ Otra conexión tomó la sesión. Cerrando esta instancia para no pelear por ella.');
+                return apagar(1);
             }
 
             if (statusCode === DisconnectReason.restartRequired) {
@@ -607,20 +608,22 @@ process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.me
 async function main() {
     pool = crearPool();
     // Espera aquí hasta que la instancia vieja de Render suelte la sesión de WhatsApp
-    lockClient = await adquirirBloqueo();
+    lockClient = await adquirirBloqueo(pool);
     await cargarMemoria();
     await iniciarBot();
 }
 
-async function apagar() {
+async function apagar(codigo) {
+    // codigo === 1 => salida "con error" para que Render reinicie el servicio
+    // (las señales SIGTERM/SIGINT llegan aquí como texto, y eso cuenta como salida normal)
     if (apagando) return;
     apagando = true;
     console.log('🛑 Apagando de forma ordenada...');
     try { sockActual?.end(undefined); } catch (e) {}
     await new Promise((r) => setTimeout(r, 1500)); // deja terminar escrituras pendientes
-    try { lockClient?.removeAllListeners('error'); await lockClient?.end(); } catch (e) {}
+    try { await lockClient?.liberar(); } catch (e) {}
     try { await pool?.end(); } catch (e) {}
-    process.exit(0);
+    process.exit(codigo === 1 ? 1 : 0);
 }
 process.on('SIGTERM', apagar);
 process.on('SIGINT', apagar);

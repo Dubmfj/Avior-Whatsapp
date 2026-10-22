@@ -1,10 +1,17 @@
 // auth-postgres.js
-// Auth state de Baileys en PostgreSQL + bloqueo de instancia única + almacén clave/valor.
-// Requiere: npm i pg
-const { Pool, Client } = require('pg');
+// Auth state de Baileys en PostgreSQL + "propiedad" de la sesión (una sola instancia escribe)
+// + almacén clave/valor. Requiere: npm i pg
+const crypto = require('crypto');
+const { Pool } = require('pg');
 const { proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 
-const LOCK_ID = 740123; // entero fijo, único para este bot
+const SESION_LOCK = 'avi';                        // nombre de la sesión protegida
+const INSTANCIA_ID = crypto.randomUUID();         // identidad de ESTE proceso
+const LATIDO_MS = 10 * 1000;                      // cada cuánto renueva su propiedad
+const CADUCA_SEG = 45;                            // si no renueva en 45s, otra instancia puede tomarla
+const FALLOS_MAX = 3;                             // 3 latidos fallidos (~30s) => esta instancia se retira
+
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function configPg() {
     if (!process.env.DATABASE_URL) throw new Error('Falta la variable DATABASE_URL');
@@ -12,7 +19,9 @@ function configPg() {
         connectionString: process.env.DATABASE_URL,
         // PGSSL=off si usas la URL interna de Render; por defecto SSL sin verificar
         ssl: process.env.PGSSL === 'off' ? false : { rejectUnauthorized: false },
-        keepAlive: true
+        keepAlive: true,
+        connectionTimeoutMillis: 10000,
+        query_timeout: 10000
     };
 }
 
@@ -28,32 +37,80 @@ async function prepararTablas(pool) {
             value      TEXT NOT NULL,
             PRIMARY KEY (session_id, key)
         )`);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS baileys_owner (
+            session_id TEXT PRIMARY KEY,
+            owner      TEXT NOT NULL,
+            beat       TIMESTAMPTZ NOT NULL
+        )`);
 }
 
 // -------------------------------------------------------------------------
-// Instancia única: en Render, durante un deploy corren DOS instancias a la vez.
-// Dos procesos con las mismas claves Signal = ratchets desincronizados = "Esperando el mensaje".
-// El advisory lock es de sesión: si el proceso muere, Postgres lo libera solo.
-// OJO: usa la conexión DIRECTA, no la de PgBouncer/pooler (ahí los advisory locks no funcionan).
+// PROPIEDAD DE LA SESIÓN (reemplaza al advisory lock)
+// Solo UNA instancia puede ser "dueña" de la sesión de WhatsApp. El dueño renueva su
+// marca de tiempo cada 10s. Si deja de renovar 45s, otra instancia puede tomarla.
+// Además, TODA escritura de claves verifica que seguimos siendo dueños: una instancia
+// "zombie" no puede corromper la sesión aunque algo falle. Funciona también con
+// conexiones por pooler (PgBouncer), a diferencia de los advisory locks.
 // -------------------------------------------------------------------------
-async function adquirirBloqueo() {
+function salirPorPerdidaDePropiedad(motivo) {
+    console.error(`❌ ${motivo}. Saliendo para que Render reinicie esta instancia limpia.`);
+    process.exit(1);
+}
+
+async function renovar(q) {
+    const r = await q.query(
+        'UPDATE baileys_owner SET beat = now() WHERE session_id = $1 AND owner = $2',
+        [SESION_LOCK, INSTANCIA_ID]
+    );
+    return r.rowCount === 1;
+}
+
+async function adquirirBloqueo(pool) {
+    await prepararTablas(pool);
+
     for (;;) {
-        const client = new Client(configPg());
-        client.on('error', (e) => {
-            console.error('❌ Se perdió la conexión del bloqueo, saliendo para reiniciar limpio:', e.message);
-            process.exit(1);
-        });
-        await client.connect();
-        const { rows } = await client.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_ID]);
-        if (rows[0].ok) {
-            console.log('🔒 Bloqueo de instancia única adquirido.');
-            return client;
-        }
-        client.removeAllListeners('error');
-        await client.end().catch(() => {});
-        console.log('⏳ Otra instancia tiene la sesión de WhatsApp; reintentando en 5s...');
-        await new Promise((r) => setTimeout(r, 5000));
+        const r = await pool.query(
+            `INSERT INTO baileys_owner (session_id, owner, beat) VALUES ($1, $2, now())
+             ON CONFLICT (session_id) DO UPDATE SET owner = EXCLUDED.owner, beat = now()
+             WHERE baileys_owner.owner = EXCLUDED.owner
+                OR baileys_owner.beat < now() - ($3::int * interval '1 second')
+             RETURNING owner`,
+            [SESION_LOCK, INSTANCIA_ID, CADUCA_SEG]
+        );
+        if (r.rowCount === 1) break;
+        console.log('⏳ Otra instancia es dueña de la sesión de WhatsApp; reintentando en 3s...');
+        await dormir(3000);
     }
+    console.log(`🔒 Propiedad de la sesión adquirida (instancia ${INSTANCIA_ID.slice(0, 8)}).`);
+
+    let fallos = 0;
+    const timer = setInterval(async () => {
+        try {
+            if (!(await renovar(pool))) {
+                return salirPorPerdidaDePropiedad('Otra instancia tomó la sesión');
+            }
+            fallos = 0;
+        } catch (e) {
+            fallos++;
+            console.error(`⚠️ No se pudo renovar la propiedad (${fallos}/${FALLOS_MAX}):`, e.message);
+            if (fallos >= FALLOS_MAX) {
+                salirPorPerdidaDePropiedad('Sin conexión estable a la base de datos');
+            }
+        }
+    }, LATIDO_MS);
+
+    return {
+        // Se llama al apagar: deja la sesión libre al instante para la instancia nueva
+        liberar: async () => {
+            clearInterval(timer);
+            await pool.query(
+                'UPDATE baileys_owner SET beat = to_timestamp(0) WHERE session_id = $1 AND owner = $2',
+                [SESION_LOCK, INSTANCIA_ID]
+            );
+            console.log('🔓 Propiedad de la sesión liberada.');
+        }
+    };
 }
 
 // -------------------------------------------------------------------------
@@ -82,7 +139,12 @@ async function usePostgresAuthState(pool, sessionId = 'avi') {
     let cola = Promise.resolve();
     const saveCreds = () => {
         cola = cola
-            .then(() => upsert(pool, 'creds', creds))
+            .then(async () => {
+                if (!(await renovar(pool))) {
+                    return salirPorPerdidaDePropiedad('Escritura de creds rechazada: ya no soy dueño de la sesión');
+                }
+                await upsert(pool, 'creds', creds);
+            })
             .catch((e) => console.error('❌ Error guardando creds:', e.message));
         return cola;
     };
@@ -112,6 +174,11 @@ async function usePostgresAuthState(pool, sessionId = 'avi') {
             const client = await pool.connect();
             try {
                 await client.query('BEGIN');
+                // Cerco: si ya no somos dueños de la sesión, NO se escribe nada
+                if (!(await renovar(client))) {
+                    await client.query('ROLLBACK').catch(() => {});
+                    return salirPorPerdidaDePropiedad('Escritura de claves rechazada: ya no soy dueño de la sesión');
+                }
                 for (const categoria of Object.keys(data)) {
                     for (const id of Object.keys(data[categoria])) {
                         const valor = data[categoria][id];
