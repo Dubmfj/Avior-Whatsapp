@@ -4,11 +4,9 @@
   "description": "Bot comercial de WhatsApp para Scroll Studios",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "build": "echo 'Build OK'"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "axios": "^1.6.8",
     "dotenv": "^16.4.5",
