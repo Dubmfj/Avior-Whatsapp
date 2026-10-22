@@ -7,15 +7,50 @@ const http = require('http');
 const puppeteer = require('puppeteer');
 
 // =========================================================================
-// 0. HEALTH CHECK HTTP PARA RENDER (EVITA QUE RENDER MATE LA INSTANCIA)
+// 0. SERVIDOR HTTP Y VISUALIZADOR WEB DEL QR PARA RENDER
 // =========================================================================
 const PORT = process.env.PORT || 10000;
+let latestQR = '';
+
 const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Avi WhatsApp Bot - Service Active');
+    // Si entran a la raíz '/', mostramos el QR nítido para escanear fácilmente
+    if (req.url === '/' || req.url === '') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        if (latestQR) {
+            res.end(`
+                <html>
+                    <head>
+                        <title>Avi WhatsApp - Escanear QR</title>
+                        <meta http-equiv="refresh" content="15">
+                    </head>
+                    <body style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #111; color: white; font-family: sans-serif;">
+                        <h1>Escanea el QR para Avi (Scroll Studios)</h1>
+                        <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(latestQR)}" alt="QR WhatsApp" style="border: 10px solid white; border-radius: 10px; background: white;" />
+                        <p style="margin-top: 20px; color: #aaa; text-align: center;">La página se actualiza sola cada 15 segundos si el código caduca.<br>También puedes verlo en los logs de Render.</p>
+                    </body>
+                </html>
+            `);
+        } else {
+            res.end(`
+                <html>
+                    <head>
+                        <title>Avi WhatsApp Bot</title>
+                    </head>
+                    <body style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #111; color: white; font-family: sans-serif;">
+                        <h1>¡El bot está encendido y activo!</h1>
+                        <p style="color: #aaa; text-align: center;">Esperando el código QR o ya se encuentra vinculado a una sesión activa.</p>
+                    </body>
+                </html>
+            `);
+        }
+    } else {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Avi WhatsApp Bot - Service Active');
+    }
 });
+
 server.listen(PORT, () => {
-    console.log(`🌐 Servidor HTTP activo en el puerto ${PORT} (Health Check para Render)`);
+    console.log(`🌐 Servidor HTTP activo en el puerto ${PORT} (Health Check y Visor QR)`);
 });
 
 // Endpoint de la API en Render
@@ -334,7 +369,7 @@ Plantea 2 opciones resumidas si aplican y sugiere revisarlo en la reunión.
 El único paso de cierre por WhatsApp es agendar la llamada o solicitar datos de contacto.
 
 19. NO PERSEGUIR AL CLIENTE
-Si el usuario dice "Lo voy a pensar", responde amable, sin presionar y dejando la puerta abierta.
+Si el usuario says "Lo voy a pensar", responde amable, sin presionar y dejando la puerta abierta.
 
 20. CIERRE CUANDO EL PRESUPUESTO ES BAJO
 Sugiérele adaptar o simplificar el alcance del proyecto para ajustarse a su presupuesto en lugar de hacer descuentos arbitrarios.
@@ -389,7 +424,7 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 5. INICIALIZACIÓN DE WHATSAPP
+// 5. INICIALIZACIÓN DE WHATSAPP (CON CHROME DEL SISTEMA / DOCKER)
 // =========================================================================
 const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
@@ -409,13 +444,16 @@ const client = new Client({
 });
 
 client.on('qr', (qr) => {
-    console.log('\n--- ESCANEA ESTE CÓDIGO QR CON TU WHATSAPP ---\n');
+    latestQR = qr;
+    console.log('\n--- CÓDIGO QR RECIBIDO ---');
+    console.log(`🔗 Ábrelo en tu navegador: https://avior-whatsapp.onrender.com`);
     qrcode.generate(qr, { small: true });
 });
 
 client.on('ready', () => {
+    latestQR = ''; // Limpiamos el QR al conectar
     console.log(`\n==============================================`);
-    console.log(`¡Avi en línea! Depurado y listo para producción 24/7.`);
+    console.log(`¡Avi en línea! Conectado con éxito y listo para producción.`);
     console.log(`==============================================\n`);
 });
 
