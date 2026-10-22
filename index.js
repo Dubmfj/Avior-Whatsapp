@@ -395,7 +395,7 @@ const client = new Client({
     authStrategy: new LocalAuth({ dataPath: './session-avior' }),
     puppeteer: {
         headless: true,
-        executablePath: puppeteer.executablePath(), // <--- Esto usa la ruta exacta del Chrome estable instalado
+        executablePath: puppeteer.executablePath(), // <--- Apuntará perfecto a la 127 instalada
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
