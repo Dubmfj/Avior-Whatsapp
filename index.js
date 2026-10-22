@@ -2,6 +2,7 @@ const {
     default: makeWASocket,
     DisconnectReason,
     fetchLatestBaileysVersion,
+    jidNormalizedUser,
     Browsers,
     makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
@@ -80,8 +81,13 @@ async function generarConGemini(gemini, historial) {
     }
 }
 
-// Números externos autorizados para ejecutar comandos admin (opcional)
-const NUMEROS_ADMIN = [];
+// Números externos autorizados para ejecutar comandos admin (opcional).
+// Solo dígitos con código de país. Ej: ['51922501122']
+// Mejor opción: define ADMIN_NUMBER en Render con tu OTRO número (solo dígitos, ej: 51922501122).
+// Desde ese número le escribes los comandos al bot, y ahí te llegan respuestas y alertas.
+// (El chat contigo mismo falla seguido con "Esperando el mensaje".)
+const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '').replace(/\D/g, '');
+const NUMEROS_ADMIN = ADMIN_NUMBER ? [ADMIN_NUMBER] : [];
 
 // 📌 TU CHAT PERSONAL
 const MI_CHAT_PERSONAL = '51987355501@s.whatsapp.net';
@@ -113,11 +119,98 @@ const COMANDOS_ADMIN = [
     '!db on', '!db off', '!db auto', '!db status', '!db flush'
 ];
 
+// ---- Helpers de identidad (WhatsApp ahora usa LID además del número) ----
+function aNumero(n) {
+    if (!n) return 0;
+    if (typeof n === 'number') return n;
+    if (typeof n === 'object') return typeof n.toNumber === 'function' ? n.toNumber() : (n.low || 0);
+    return Number(n) || 0;
+}
+
+function soloNumero(jid) {
+    return String(jid || '').split('@')[0].split(':')[0];
+}
+
+// JIDs que representan tu propio chat ("Tú" / mensajes a ti mismo)
+function jidsPropios(sock) {
+    const lista = [MI_CHAT_PERSONAL];
+    if (sock.user?.id) lista.push(jidNormalizedUser(sock.user.id));
+    if (sock.user?.lid) lista.push(jidNormalizedUser(sock.user.lid));
+    return lista;
+}
+
+function esChatPropio(sock, jid) {
+    if (!sock) return false;
+    return jidsPropios(sock).includes(jid);
+}
+
+// A dónde mandar las notificaciones y respuestas de admin (tu chat contigo mismo).
+// Se usa el LID si existe: enviar al número viejo es lo que dejaba "Esperando este mensaje".
+function miChat(sock) {
+    if (ADMIN_NUMBER) return `${ADMIN_NUMBER}@s.whatsapp.net`;
+    return sock.user?.lid ? jidNormalizedUser(sock.user.lid) : MI_CHAT_PERSONAL;
+}
+
+// Alertas recientes (se muestran en el panel web /admin; se pierden al reiniciar)
+const alertas = [];
+function registrarAlerta(texto) {
+    const hora = new Date().toLocaleString('es-PE', { timeZone: 'America/Lima' });
+    alertas.unshift(`${hora} — ${texto}`);
+    if (alertas.length > 20) alertas.pop();
+}
+function esc(t) {
+    return String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
 // =========================================================================
 // 1. SERVIDOR HTTP (health check + visor del QR protegido)
 // =========================================================================
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost');
+
+    // Panel de administración web (no depende de WhatsApp para responder)
+    if (url.pathname === '/admin') {
+        if (!QR_TOKEN || url.searchParams.get('key') !== QR_TOKEN) {
+            res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+            return res.end('Acceso denegado. Define QR_TOKEN en Render y entra con /admin?key=TU_CLAVE');
+        }
+
+        const cmd = (url.searchParams.get('cmd') || '').toLowerCase().trim();
+        let salida = '';
+        if (cmd) {
+            if (!COMANDOS_ADMIN.includes(cmd) || cmd === '!admin' || cmd === '!help') {
+                salida = 'Comando no permitido.';
+            } else {
+                const partes = [];
+                try {
+                    await ejecutarComando(null, cmd, 'panel', 'panel', null, (t) => partes.push(t));
+                    salida = partes.join('\n\n') || 'Hecho.';
+                } catch (e) {
+                    salida = 'Error: ' + (e?.message || e);
+                }
+            }
+        }
+
+        const k = encodeURIComponent(QR_TOKEN);
+        const botones = ['!bot status', '!bot on', '!bot off', '!unpause all', '!db status', '!db flush', '!db on', '!db auto', '!db off']
+            .map((c) => `<a class="b" href="/admin?key=${k}&cmd=${encodeURIComponent(c)}">${esc(c)}</a>`).join('');
+
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Avi - Panel</title>
+<style>
+body{margin:0;padding:20px;background:#111;color:#fff;font-family:sans-serif}
+h1{font-size:20px}.b{display:inline-block;margin:4px;padding:12px 16px;background:#1f6feb;color:#fff;border-radius:8px;text-decoration:none;font-size:15px}
+pre{background:#1b1b1b;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-word}.m{color:#aaa;font-size:14px}
+</style></head><body>
+<h1>🤖 Panel de Avi</h1>
+<p class="m">WhatsApp: <b>${conectado ? 'conectado ✅' : 'desconectado ❌'}</b> · Modo: <b>${ignorarHorario ? 'activado a mano (24/7)' : 'automático (10 PM - 6:30 AM)'}</b> · Respondiendo ahora: <b>${esHorarioDeBot() ? 'sí' : 'no'}</b> · Chats pausados: <b>${Object.keys(chatsPausados).length}</b></p>
+<div>${botones}</div>
+${salida ? `<h3>Resultado</h3><pre>${esc(salida)}</pre>` : ''}
+<h3>Alertas recientes</h3>
+<pre>${alertas.length ? esc(alertas.join('\n')) : 'Sin alertas desde el último reinicio.'}</pre>
+</body></html>`);
+    }
 
     if (url.pathname === '/qr') {
         if (QR_TOKEN && url.searchParams.get('key') !== QR_TOKEN) {
@@ -279,8 +372,9 @@ function extraerTexto(msg) {
 // =========================================================================
 // 5. COMANDOS ADMIN (siempre responden a tu chat personal, nunca al cliente)
 // =========================================================================
-async function ejecutarComando(sock, comando, chatId, numeroReal) {
-    const responder = (texto) => enviar(sock, MI_CHAT_PERSONAL, { text: texto });
+async function ejecutarComando(sock, comando, chatId, numeroReal, destino, salida) {
+    // Si viene 'salida' (panel web) no se manda nada por WhatsApp
+    const responder = salida ? (texto) => salida(texto) : (texto) => enviar(sock, destino || miChat(sock), { text: texto });
 
     // Control del bot: !bot on = lo activas a mano (24/7, y Neon habilitado)
     //                  !bot off / !bot auto = vuelve al horario automático 22:00-06:30
@@ -323,7 +417,7 @@ async function ejecutarComando(sock, comando, chatId, numeroReal) {
     }
 
     if (comando === '!unpause' || comando === '!despausar') {
-        if (chatId === MI_CHAT_PERSONAL) {
+        if (chatId === 'panel' || esChatPropio(sock, chatId)) {
             return responder('⚙️ *ADMIN:* Escribe !unpause dentro del chat del cliente, o usa !unpause all.');
         }
         if (chatsPausados[chatId]) {
@@ -365,7 +459,15 @@ async function procesarMensaje(sock, msg) {
     if (tiposReales.length === 0) return;
 
     const esMensajeMio = msg.key.fromMe;
-    const numeroReal = idRemitente.split('@')[0];
+
+    // Ignora mensajes viejos que WhatsApp reenvía al reconectar (si no, pausarían chats por error)
+    const ts = aNumero(msg.messageTimestamp);
+    const edadSeg = ts ? (Date.now() / 1000 - ts) : 0;
+    if (esMensajeMio && edadSeg > 90) return;     // tus mensajes: solo los recientes
+    if (!esMensajeMio && edadSeg > 900) return;   // clientes: hasta 15 min de antigüedad
+
+    // Número real (si el chat viene como LID, WhatsApp manda el número en remoteJidAlt)
+    const numeroReal = soloNumero(msg.key.remoteJidAlt || idRemitente);
     const userMessage = extraerTexto(msg);
     const mensajeLower = userMessage.toLowerCase();
     const esComandoAdmin = COMANDOS_ADMIN.includes(mensajeLower);
@@ -373,10 +475,10 @@ async function procesarMensaje(sock, msg) {
     // ---- Mensajes enviados desde TU WhatsApp ----
     if (esMensajeMio) {
         if (esComandoAdmin) {
-            await ejecutarComando(sock, mensajeLower, idRemitente, numeroReal);
+            await ejecutarComando(sock, mensajeLower, idRemitente, numeroReal, miChat(sock));
             return;
         }
-        if (idRemitente === MI_CHAT_PERSONAL) return;
+        if (esChatPropio(sock, idRemitente)) return;
 
         chatsPausados[idRemitente] = Date.now() + (2 * 60 * 60 * 1000);
         guardarPausas();
@@ -385,11 +487,13 @@ async function procesarMensaje(sock, msg) {
     }
 
     // ---- Mensajes de otras personas ----
-    if (idRemitente === MI_CHAT_PERSONAL) return;
+    if (esChatPropio(sock, idRemitente)) return;
 
     if (esComandoAdmin) {
-        if (NUMEROS_ADMIN.includes(idRemitente)) {
-            await ejecutarComando(sock, mensajeLower, idRemitente, numeroReal);
+        if (NUMEROS_ADMIN.includes(numeroReal)) {
+            await ejecutarComando(sock, mensajeLower, idRemitente, numeroReal, idRemitente);
+        } else {
+            console.log(`🚫 Comando "${mensajeLower}" ignorado: no es admin | remoteJid: ${idRemitente} | remoteJidAlt: ${msg.key.remoteJidAlt || 'no viene'} | número detectado: ${numeroReal}`);
         }
         return;
     }
@@ -406,7 +510,8 @@ async function procesarMensaje(sock, msg) {
     if (registroSpam[idRemitente].length > 4) {
         chatsPausados[idRemitente] = ahora + (5 * 60 * 1000);
         guardarPausas();
-        await enviar(sock, MI_CHAT_PERSONAL, { text: `⚠️ *ALERTA ANTI-SPAM:* Se pausó el chat de +${numeroReal}.` });
+        registrarAlerta(`Anti-spam: se pausó el chat de +${numeroReal}`);
+        await enviar(sock, miChat(sock), { text: `⚠️ *ALERTA ANTI-SPAM:* Se pausó el chat de +${numeroReal}.` });
         return;
     }
 
@@ -490,7 +595,8 @@ async function procesarMensaje(sock, msg) {
             pregunta = match[2].trim();
         }
 
-        await enviar(sock, MI_CHAT_PERSONAL, {
+        registrarAlerta(`Asesor humano: +${numeroReal} — ${resumen} | ${pregunta}`);
+        await enviar(sock, miChat(sock), {
             text: `🚨 *SOLICITUD DE ASESOR HUMANO*\n\n📱 *Cliente:* +${numeroReal}\n📋 *Resumen:* ${resumen}\n❓ *Consulta:* ${pregunta}`
         });
 
@@ -637,6 +743,7 @@ async function iniciarBot() {
             intentos = 0;
             console.log(`\n==============================================`);
             console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp.`);
+            console.log(`   Cuenta: ${sock.user?.id || '?'} | LID: ${sock.user?.lid || '?'} | Admin → ${miChat(sock)}`);
             console.log(`==============================================\n`);
         }
     });
