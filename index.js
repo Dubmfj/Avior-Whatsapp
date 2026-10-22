@@ -1,8 +1,7 @@
 const {
     default: makeWASocket,
     useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion
+    DisconnectReason
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const axios = require('axios');
@@ -10,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const qrcode = require('qrcode-terminal');
+const { Boom } = require('@hapi/boom');
 
 // =========================================================================
 // 0. SERVIDOR HTTP Y VISUALIZADOR WEB DEL QR PARA RENDER
@@ -372,7 +372,7 @@ Estructura concisa: Valor/Solución + Precio referencial + Siguiente paso.
 Para referencias rápidas, da el rango inicial como guía e invita a afinarlo.
 
 26. REGLA DE PROYECTOS GRANDES
-En CRM, sistemas o IA avanzada, invita a la reunión de diagnóstico.
+In CRM, sistemas o IA avanzada, invita a la reunión de diagnóstico.
 
 27. REGLA DE HONESTIDAD COMERCIAL
 Nunca inventes una cotización definitiva por chat solo por dar una respuesta rápida.
@@ -406,33 +406,23 @@ PREGUNTA: (Duda o petición del cliente)
 `;
 
 // =========================================================================
-// 4. INICIALIZACIÓN DE BAILEYS (CONEXIÓN ROBUSTA Y ANTI-BLOQUEO RENDER)
+// 4. INICIALIZACIÓN DE BAILEYS (CONEXIÓN ESTABLE PARA RENDER)
 // =========================================================================
 async function iniciarBot() {
     console.log('🚀 Iniciando motor de Baileys...');
     
     const { state, saveCreds } = await useMultiFileAuthState('./session-baileys');
 
-    let version = [2, 3000, 1015901307];
-    try {
-        const fetchedVersion = await fetchLatestBaileysVersion();
-        if (fetchedVersion && fetchedVersion.version) {
-            version = fetchedVersion.version;
-        }
-    } catch (e) {
-        console.log('⚠️ Usando versión fallback de Baileys.');
-    }
-
     const sock = makeWASocket({
-        version,
         auth: state,
         printQRInTerminal: true,
         logger: pino({ level: 'silent' }),
         browser: ['Ubuntu', 'Chrome', '120.0.6099.109'],
         connectTimeoutMs: 60000,
-        retryRequestDelayMs: 5000,
-        markOnlineOnConnect: true,
-        fireInitQueries: true
+        defaultQueryTimeoutMs: undefined,
+        keepAliveIntervalMs: 25000,
+        emitOwnEvents: true,
+        markOnlineOnConnect: true
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -448,13 +438,13 @@ async function iniciarBot() {
         }
 
         if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const statusCode = (lastDisconnect?.error instanceof Boom) ? lastDisconnect.error.output.statusCode : lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
             console.log(`⚠️ Conexión cerrada (Código: ${statusCode || 'Desconocido'}). ¿Reconectar?: ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                setTimeout(iniciarBot, 8000);
+                setTimeout(iniciarBot, 5000);
             } else {
                 console.log('❌ Sesión cerrada permanentemente. Limpiando carpeta session-baileys...');
                 try {
@@ -471,7 +461,7 @@ async function iniciarBot() {
     });
 
     // =========================================================================
-    // 5. MANEJADOR PRINCIPAL DE MENSAJES
+    // 5. MANEJADOR PRINCIPAL DE MENSAJES (INTACTO)
     // =========================================================================
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
