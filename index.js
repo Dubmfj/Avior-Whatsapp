@@ -400,6 +400,11 @@ async function procesarMensaje(sock, msg) {
 
     if (response.status !== 200) {
         console.log('--- ERROR HTTP DETECTADO EN API ---', response.status);
+        // CAMBIO 13: muestra el cuerpo del error para saber la causa real (cuota, límite, etc.)
+        try {
+            const cuerpo = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+            console.log('Detalle del error de la API:', String(cuerpo).slice(0, 800));
+        } catch (e) {}
         await enviar(sock, idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
         return;
     }
