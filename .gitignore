@@ -1,5 +1,7 @@
 node_modules/
+session-baileys/
 session-avior/
 .wwebjs_cache/
 historiales.json
 pausas.json
+.env

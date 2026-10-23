@@ -1,16 +1,18 @@
+// index.js — Avi (Scroll Studios)
+// WhatsApp (Baileys) + Gemini directo + sesión, pausas e historiales en Postgres (Neon) + panel web /admin
+const crypto = require('crypto');
+const http = require('http');
+const pino = require('pino');
+const QRCode = require('qrcode');
 const {
     default: makeWASocket,
     DisconnectReason,
     fetchLatestBaileysVersion,
     jidNormalizedUser,
+    normalizeMessageContent,
     Browsers,
     makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const axios = require('axios');
-const http = require('http');
-const QRCode = require('qrcode');
-const qrcodeTerminal = require('qrcode-terminal');
 const PROMPT_SISTEMA_AVI = require('./prompt-avi');
 const {
     crearPool,
@@ -20,83 +22,58 @@ const {
     kvSet,
     descartarPendiente
 } = require('./auth-postgres');
-// NUEVO: controla cuándo Neon está habilitado y cada cuánto se guardan los cambios
 const dbVentana = require('./db-ventana');
 
 // =========================================================================
-// 0. CONFIGURACIÓN (variables de entorno opcionales en Render)
+// 0. CONFIGURACIÓN
 // =========================================================================
 const PORT = process.env.PORT || 10000;
-const QR_TOKEN = process.env.QR_TOKEN || '';
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+
+// Clave para entrar a /qr y /admin. Ejemplo: https://TU-SERVICIO.onrender.com/admin?key=11112009
+// Está FIJA aquí a propósito: no depende de la variable QR_TOKEN de Render (si existe con otro
+// valor, se ignora). Para cambiarla, edita esta línea y vuelve a desplegar.
+const QR_TOKEN = '11112009';
+
+const LOG_LEVEL = process.env.LOG_LEVEL || 'warn';   // 'info' para depurar
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || '';
 const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || '').replace(/\D/g, '');
 
-const API_URL = 'https://avior-ai.onrender.com/api/chat-wsp';
-
-// Llamada DIRECTA a Gemini (sin pasar por avior-ai)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 
-let clienteGemini = null;
-async function obtenerGemini() {
-    if (!GEMINI_API_KEY) return null;
-    if (!clienteGemini) {
-        try {
-            const { GoogleGenAI } = await import('@google/genai');
-            clienteGemini = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-        } catch (e) {
-            console.error('❌ No se pudo cargar @google/genai (¿falta npm install @google/genai?). Usando la API:', e?.message || e);
-            return null;
-        }
-    }
-    return clienteGemini;
-}
-
-async function generarConGemini(gemini, historial) {
-    const contents = historial.map((m) => ({
-        role: m.role === 'model' ? 'model' : 'user',
-        parts: [{ text: String(m.content ?? '') }]
-    }));
-    while (contents.length && contents[0].role !== 'user') contents.shift();
-
-    const intentosMax = 3;
-    for (let i = 0; i < intentosMax; i++) {
-        try {
-            const respuesta = await gemini.models.generateContent({
-                model: GEMINI_MODEL,
-                contents,
-                config: { systemInstruction: PROMPT_SISTEMA_AVI }
-            });
-            return String(respuesta.text || '').trim();
-        } catch (error) {
-            const reintentable = error?.status === 503 || error?.status === 429;
-            if (reintentable && i < intentosMax - 1) {
-                console.warn(`[Gemini ${error.status}] reintentando (${i + 1}/${intentosMax})...`);
-                await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
-                continue;
-            }
-            throw error;
-        }
-    }
-}
-
-// Números externos autorizados para ejecutar comandos admin (opcional).
-// Solo dígitos con código de país. Ej: ['51922501122']
-// Mejor opción: define ADMIN_NUMBER en Render con tu OTRO número (solo dígitos, ej: 51922501122).
-// Desde ese número le escribes los comandos al bot, y ahí te llegan respuestas y alertas.
-// (El chat contigo mismo falla seguido con "Esperando el mensaje".)
+// Número desde el que puedes mandarle comandos al bot (solo dígitos con código de país).
+// Define ADMIN_NUMBER en Render con tu OTRO número, ej: 51922501122
 const ADMIN_NUMBER = (process.env.ADMIN_NUMBER || '').replace(/\D/g, '');
 const NUMEROS_ADMIN = ADMIN_NUMBER ? [ADMIN_NUMBER] : [];
 
-// 📌 TU CHAT PERSONAL
 const MI_CHAT_PERSONAL = '51987355501@s.whatsapp.net';
+const MENSAJE_ERROR = 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.';
 
-// Estado en memoria
+// Horario automático del bot (hora de Lima): 10:00 PM a 6:30 AM
+const BOT_INICIO_MIN = 22 * 60;
+const BOT_FIN_MIN = 6 * 60 + 30;
+
+const COMANDOS_ADMIN = [
+    '!unpause', '!despausar', '!unpause all', '!despausar todo', '!admin', '!help',
+    '!bot on', '!bot off', '!bot auto', '!bot status',
+    '!db on', '!db off', '!db auto', '!db status', '!db flush'
+];
+const COMANDOS_PANEL = [
+    '!bot status', '!bot on', '!bot off', '!unpause all',
+    '!db status', '!db flush', '!db on', '!db auto', '!db off'
+];
+const TIPOS_TECNICOS = [
+    'protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage',
+    'messageContextInfo', 'pollUpdateMessage', 'keepInChatMessage'
+];
+
+// =========================================================================
+// 1. ESTADO EN MEMORIA
+// =========================================================================
 let chatsPausados = {};
 let historialesChats = {};
 const registroSpam = {};
-let ignorarHorario = false;
+let ignorarHorario = false;      // true = activado a mano con !bot on (24/7)
 
 let latestQR = '';
 let latestPairingCode = '';
@@ -106,20 +83,43 @@ let pool = null;
 let lockClient = null;
 let authActual = null;
 let apagando = false;
+let sockActual = null;
+let reconexionProgramada = false;
+let intentos = 0;
 
-const mensajesDelBot = new Set();
-const mensajesEnviados = new Map();
+// Mensajes que envió el propio bot: id -> contenido (sirve para no confundirlos con una
+// intervención tuya y para que Baileys pueda reenviarlos si el cliente pide un reintento)
+const enviados = new Map();
 
-const COMANDOS_ADMIN = [
-    '!unpause', '!despausar',
-    '!unpause all', '!despausar todo', '!admin', '!help',
-    // Control del bot (horario automático 22:00-06:30)
-    '!bot on', '!bot off', '!bot auto', '!bot status',
-    // NUEVO: control de la base de datos Neon
-    '!db on', '!db off', '!db auto', '!db status', '!db flush'
-];
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---- Helpers de identidad (WhatsApp ahora usa LID además del número) ----
+// Alertas recientes (se ven en /admin; se pierden al reiniciar)
+const alertas = [];
+function registrarAlerta(texto) {
+    const hora = new Date().toLocaleString('es-PE', { timeZone: 'America/Lima' });
+    alertas.unshift(`${hora} — ${texto}`);
+    if (alertas.length > 20) alertas.pop();
+}
+
+function esc(t) {
+    return String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+// Un chat a la vez: si un cliente manda varios mensajes seguidos, se procesan en orden
+// (si no, las respuestas de Gemini se cruzan y el historial queda desordenado)
+const colas = new Map();
+function enCola(clave, tarea) {
+    const previa = colas.get(clave) || Promise.resolve();
+    const actual = previa.then(tarea, tarea);
+    colas.set(clave, actual);
+    const limpiar = () => { if (colas.get(clave) === actual) colas.delete(clave); };
+    actual.then(limpiar, limpiar);
+    return actual;
+}
+
+// =========================================================================
+// 2. IDENTIDAD (WhatsApp usa número y LID)
+// =========================================================================
 function aNumero(n) {
     if (!n) return 0;
     if (typeof n === 'number') return n;
@@ -131,146 +131,175 @@ function soloNumero(jid) {
     return String(jid || '').split('@')[0].split(':')[0];
 }
 
-// JIDs que representan tu propio chat ("Tú" / mensajes a ti mismo)
-function jidsPropios(sock) {
-    const lista = [MI_CHAT_PERSONAL];
-    if (sock.user?.id) lista.push(jidNormalizedUser(sock.user.id));
-    if (sock.user?.lid) lista.push(jidNormalizedUser(sock.user.lid));
-    return lista;
-}
-
 function esChatPropio(sock, jid) {
     if (!sock) return false;
-    return jidsPropios(sock).includes(jid);
+    const propios = [MI_CHAT_PERSONAL];
+    if (sock.user?.id) propios.push(jidNormalizedUser(sock.user.id));
+    if (sock.user?.lid) propios.push(jidNormalizedUser(sock.user.lid));
+    return propios.includes(jid);
 }
 
-// A dónde mandar las notificaciones y respuestas de admin (tu chat contigo mismo).
-// Se usa el LID si existe: enviar al número viejo es lo que dejaba "Esperando este mensaje".
+// A dónde mandar notificaciones y respuestas de admin
 function miChat(sock) {
     if (ADMIN_NUMBER) return `${ADMIN_NUMBER}@s.whatsapp.net`;
-    return sock.user?.lid ? jidNormalizedUser(sock.user.lid) : MI_CHAT_PERSONAL;
-}
-
-// Alertas recientes (se muestran en el panel web /admin; se pierden al reiniciar)
-const alertas = [];
-function registrarAlerta(texto) {
-    const hora = new Date().toLocaleString('es-PE', { timeZone: 'America/Lima' });
-    alertas.unshift(`${hora} — ${texto}`);
-    if (alertas.length > 20) alertas.pop();
-}
-function esc(t) {
-    return String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    return sock?.user?.lid ? jidNormalizedUser(sock.user.lid) : MI_CHAT_PERSONAL;
 }
 
 // =========================================================================
-// 1. SERVIDOR HTTP (health check + visor del QR protegido)
+// 3. SERVIDOR HTTP (estado, /qr y /admin)
 // =========================================================================
-const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url || '/', 'http://localhost');
-
-    // Panel de administración web (no depende de WhatsApp para responder)
-    if (url.pathname === '/admin') {
-        if (!QR_TOKEN || url.searchParams.get('key') !== QR_TOKEN) {
-            res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-            return res.end('Acceso denegado. Define QR_TOKEN en Render y entra con /admin?key=TU_CLAVE');
-        }
-
-        const cmd = (url.searchParams.get('cmd') || '').toLowerCase().trim();
-        let salida = '';
-        if (cmd) {
-            if (!COMANDOS_ADMIN.includes(cmd) || cmd === '!admin' || cmd === '!help') {
-                salida = 'Comando no permitido.';
-            } else {
-                const partes = [];
-                try {
-                    await ejecutarComando(null, cmd, 'panel', 'panel', null, (t) => partes.push(t));
-                    salida = partes.join('\n\n') || 'Hecho.';
-                } catch (e) {
-                    salida = 'Error: ' + (e?.message || e);
-                }
-            }
-        }
-
-        const k = encodeURIComponent(QR_TOKEN);
-        const botones = ['!bot status', '!bot on', '!bot off', '!unpause all', '!db status', '!db flush', '!db on', '!db auto', '!db off']
-            .map((c) => `<a class="b" href="/admin?key=${k}&cmd=${encodeURIComponent(c)}">${esc(c)}</a>`).join('');
-
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        return res.end(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Avi - Panel</title>
-<style>
+const CSS = `
 body{margin:0;padding:20px;background:#111;color:#fff;font-family:sans-serif}
-h1{font-size:20px}.b{display:inline-block;margin:4px;padding:12px 16px;background:#1f6feb;color:#fff;border-radius:8px;text-decoration:none;font-size:15px}
-pre{background:#1b1b1b;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-word}.m{color:#aaa;font-size:14px}
-</style></head><body>
+h1{font-size:20px}
+.c{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:90vh;text-align:center}
+.b{display:inline-block;margin:4px;padding:12px 16px;background:#1f6feb;color:#fff;border:0;border-radius:8px;font-size:15px;cursor:pointer}
+pre{background:#1b1b1b;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-word}
+.m{color:#aaa;font-size:14px}`;
+
+function pagina(titulo, cuerpo, refresco = 0) {
+    return `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${refresco ? `<meta http-equiv="refresh" content="${refresco}">` : ''}
+<title>${esc(titulo)}</title><style>${CSS}</style></head><body>${cuerpo}</body></html>`;
+}
+
+function responder(res, codigo, tipo, cuerpo) {
+    res.writeHead(codigo, { 'Content-Type': `${tipo}; charset=utf-8` });
+    res.end(cuerpo);
+}
+
+// Comparación de la clave en tiempo constante + freno a los intentos fallidos
+// (tras 100 fallos en 10 minutos, /qr y /admin se bloquean hasta que pase la ventana)
+function claveValida(k) {
+    const a = Buffer.from(String(k || ''));
+    const b = Buffer.from(QR_TOKEN);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+const VENTANA_FALLOS_MS = 10 * 60 * 1000;
+let fallos = { n: 0, desde: 0 };
+function accesoBloqueado() {
+    return fallos.n >= 100 && Date.now() - fallos.desde < VENTANA_FALLOS_MS;
+}
+function anotarFallo() {
+    const t = Date.now();
+    if (t - fallos.desde >= VENTANA_FALLOS_MS) fallos = { n: 0, desde: t };
+    fallos.n++;
+}
+
+// Devuelve true si deja pasar; si no, ya respondió el error
+function autorizar(res, url) {
+    if (accesoBloqueado()) {
+        responder(res, 429, 'text/plain', 'Demasiados intentos. Espera unos minutos.');
+        return false;
+    }
+    if (!claveValida(url.searchParams.get('key'))) {
+        anotarFallo();
+        responder(res, 403, 'text/plain', 'Acceso denegado. La clave del link no coincide.');
+        return false;
+    }
+    return true;
+}
+
+function leerCuerpo(req) {
+    return new Promise((ok, fail) => {
+        let datos = '';
+        req.on('data', (c) => {
+            datos += c;
+            if (datos.length > 2000) { req.destroy(); fail(new Error('Cuerpo demasiado grande')); }
+        });
+        req.on('end', () => ok(datos));
+        req.on('error', fail);
+    });
+}
+
+async function ejecutarDesdePanel(cmd) {
+    if (!cmd) return '';
+    if (!COMANDOS_PANEL.includes(cmd)) return 'Comando no permitido.';
+    const partes = [];
+    try {
+        await ejecutarComando(null, cmd, 'panel', 'panel', null, (t) => partes.push(t));
+        return partes.join('\n\n') || 'Hecho.';
+    } catch (e) {
+        return 'Error: ' + (e?.message || e);
+    }
+}
+
+async function rutaAdmin(req, res, url) {
+    if (!autorizar(res, url)) return;
+
+    let salida = '';
+    if (req.method === 'POST') {
+        const cmd = (new URLSearchParams(await leerCuerpo(req)).get('cmd') || '').toLowerCase().trim();
+        salida = await ejecutarDesdePanel(cmd);
+    }
+
+    const k = encodeURIComponent(QR_TOKEN);
+    const botones = COMANDOS_PANEL.map((c) => `<button class="b" name="cmd" value="${esc(c)}">${esc(c)}</button>`).join('');
+    responder(res, 200, 'text/html', pagina('Avi - Panel', `
 <h1>🤖 Panel de Avi</h1>
-<p class="m">WhatsApp: <b>${conectado ? 'conectado ✅' : 'desconectado ❌'}</b> · Modo: <b>${ignorarHorario ? 'activado a mano (24/7)' : 'automático (10 PM - 6:30 AM)'}</b> · Respondiendo ahora: <b>${esHorarioDeBot() ? 'sí' : 'no'}</b> · Chats pausados: <b>${Object.keys(chatsPausados).length}</b></p>
-<div>${botones}</div>
+<p class="m">WhatsApp: <b>${conectado ? 'conectado ✅' : 'desconectado ❌'}</b> ·
+Modo: <b>${ignorarHorario ? 'activado a mano (24/7)' : 'automático (10 PM - 6:30 AM)'}</b> ·
+Respondiendo ahora: <b>${esHorarioDeBot() ? 'sí' : 'no'}</b> ·
+Chats pausados: <b>${Object.keys(chatsPausados).length}</b></p>
+<form method="post" action="/admin?key=${k}">${botones}</form>
 ${salida ? `<h3>Resultado</h3><pre>${esc(salida)}</pre>` : ''}
 <h3>Alertas recientes</h3>
-<pre>${alertas.length ? esc(alertas.join('\n')) : 'Sin alertas desde el último reinicio.'}</pre>
-</body></html>`);
-    }
+<pre>${alertas.length ? esc(alertas.join('\n')) : 'Sin alertas desde el último reinicio.'}</pre>`));
+}
 
-    if (url.pathname === '/qr') {
-        if (QR_TOKEN && url.searchParams.get('key') !== QR_TOKEN) {
-            res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-            return res.end('Acceso denegado');
-        }
+async function rutaQR(res, url) {
+    if (!autorizar(res, url)) return;
 
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-
-        if (latestPairingCode) {
-            return res.end(`<!doctype html>
-<html><head><meta charset="utf-8"><title>Avi WhatsApp - Código de vinculación</title>
-<meta http-equiv="refresh" content="20"></head>
-<body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;background:#111;color:#fff;font-family:sans-serif;text-align:center;padding:0 20px">
+    if (latestPairingCode) {
+        return responder(res, 200, 'text/html', pagina('Avi - Código de vinculación', `<div class="c">
 <h1>Código de vinculación para Avi</h1>
-<div style="font-size:56px;letter-spacing:8px;font-weight:bold;background:#fff;color:#111;padding:20px 30px;border-radius:12px">${latestPairingCode}</div>
-<p style="margin-top:24px;color:#aaa;max-width:420px">En WhatsApp: Dispositivos vinculados → Vincular dispositivo → <b>Vincular con el número de teléfono</b> → escribe este código.</p>
-</body></html>`);
-        }
-
-        if (latestQR) {
-            const dataUrl = await QRCode.toDataURL(latestQR, { width: 300, margin: 1 });
-            return res.end(`<!doctype html>
-<html><head><meta charset="utf-8"><title>Avi WhatsApp - Escanear QR</title>
-<meta http-equiv="refresh" content="15"></head>
-<body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;background:#111;color:#fff;font-family:sans-serif">
+<div style="font-size:56px;letter-spacing:8px;font-weight:bold;background:#fff;color:#111;padding:20px 30px;border-radius:12px">${esc(latestPairingCode)}</div>
+<p class="m" style="max-width:420px;margin-top:24px">En WhatsApp: Dispositivos vinculados → Vincular dispositivo → <b>Vincular con el número de teléfono</b> → escribe este código.</p></div>`, 20));
+    }
+    if (latestQR) {
+        const dataUrl = await QRCode.toDataURL(latestQR, { width: 300, margin: 1 });
+        return responder(res, 200, 'text/html', pagina('Avi - Escanear QR', `<div class="c">
 <h1>Escanea el QR para Avi (Scroll Studios)</h1>
 <img src="${dataUrl}" alt="QR WhatsApp" style="border:10px solid #fff;border-radius:10px;background:#fff"/>
-<p style="margin-top:20px;color:#aaa;text-align:center">La página se actualiza sola cada 15 segundos.</p>
-</body></html>`);
-        }
-
-        const estado = conectado
-            ? '¡Avi ya está vinculado y en línea!'
-            : 'Esperando el código QR... recarga en unos segundos.';
-        return res.end(`<!doctype html>
-<html><head><meta charset="utf-8"><title>Avi WhatsApp Bot</title>
-<meta http-equiv="refresh" content="10"></head>
-<body style="display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#111;color:#fff;font-family:sans-serif">
-<h1>${estado}</h1></body></html>`);
+<p class="m">La página se actualiza sola cada 15 segundos.</p></div>`, 15));
     }
+    const estado = conectado ? '¡Avi ya está vinculado y en línea!' : 'Esperando el código QR... recarga en unos segundos.';
+    responder(res, 200, 'text/html', pagina('Avi WhatsApp Bot', `<div class="c"><h1>${estado}</h1></div>`, 10));
+}
 
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end(`Avi WhatsApp Bot - Service Active | WhatsApp: ${conectado ? 'conectado' : 'desconectado'}`);
+const server = http.createServer(async (req, res) => {
+    try {
+        const url = new URL(req.url || '/', 'http://localhost');
+        if (url.pathname === '/admin') return await rutaAdmin(req, res, url);
+        if (url.pathname === '/qr') return await rutaQR(res, url);
+        responder(res, 200, 'text/plain', `Avi WhatsApp Bot - Service Active | WhatsApp: ${conectado ? 'conectado' : 'desconectado'}`);
+    } catch (e) {
+        console.error('HTTP:', e?.message || e);
+        if (!res.headersSent) responder(res, 500, 'text/plain', 'Error interno');
+        else res.end();
+    }
 });
 
-server.listen(PORT, () => {
-    console.log(`🌐 Servidor HTTP activo en el puerto ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🌐 Servidor HTTP activo en el puerto ${PORT}`));
 
 // Auto-ping para que Render free no duerma el servicio (no toca la base de datos)
 if (SELF_URL) {
     setInterval(() => {
-        axios.get(SELF_URL, { timeout: 15000 }).catch(() => {});
+        fetch(SELF_URL, { signal: AbortSignal.timeout(15000) }).catch(() => {});
     }, 10 * 60 * 1000);
 }
 
+// Limpieza periódica del registro anti-spam (si no, crece con cada número nuevo)
+setInterval(() => {
+    const limite = Date.now() - 10000;
+    for (const jid of Object.keys(registroSpam)) {
+        registroSpam[jid] = registroSpam[jid].filter((t) => t > limite);
+        if (!registroSpam[jid].length) delete registroSpam[jid];
+    }
+}, 10 * 60 * 1000).unref();
+
 // =========================================================================
-// 2. PERSISTENCIA (PAUSAS E HISTORIAL)
-//    kvSet ahora solo escribe en memoria; db-ventana.js lo guarda en lote.
+// 4. PERSISTENCIA (pausas e historiales; auth-postgres los guarda en lote)
 // =========================================================================
 async function cargarMemoria() {
     try {
@@ -278,57 +307,33 @@ async function cargarMemoria() {
         historialesChats = (await kvGet(pool, 'historiales')) || {};
         console.log('📦 Pausas e historiales cargados desde Postgres.');
     } catch (e) {
-        console.error('Error al cargar memoria:', e.message);
+        console.error('Error al cargar memoria:', e?.message || e);
     }
 }
 
-function guardarPausas() {
-    kvSet(pool, 'pausas', chatsPausados)
-        .catch((e) => console.error('Error al guardar pausas:', e.message));
-}
-
-function guardarHistoriales() {
-    kvSet(pool, 'historiales', historialesChats)
-        .catch((e) => console.error('Error al guardar historiales:', e.message));
-}
+const guardarPausas = () => kvSet(pool, 'pausas', chatsPausados).catch((e) => console.error('Error al guardar pausas:', e?.message));
 
 function agregarMensajeAHistorial(userId, rol, texto) {
-    if (!historialesChats[userId]) historialesChats[userId] = [];
-    historialesChats[userId].push({ role: rol, content: texto });
-    if (historialesChats[userId].length > 6) {
-        historialesChats[userId] = historialesChats[userId].slice(-6);
-    }
-    guardarHistoriales();
+    const lista = historialesChats[userId] || (historialesChats[userId] = []);
+    lista.push({ role: rol, content: texto });
+    if (lista.length > 6) historialesChats[userId] = lista.slice(-6);
+    kvSet(pool, 'historiales', historialesChats).catch((e) => console.error('Error al guardar historiales:', e?.message));
 }
 
 // =========================================================================
-// 3. HORARIO DEL BOT (PERÚ - UTC-5): automático SOLO de 10:00 PM a 6:30 AM
-//    Fuera de ese horario el bot está apagado, salvo que lo actives con !bot on
+// 5. HORARIO
 // =========================================================================
-const BOT_INICIO_MIN = 22 * 60;       // 10:00 PM
-const BOT_FIN_MIN = 6 * 60 + 30;      // 6:30 AM
-
-function esHorarioDeBot() {
-    if (ignorarHorario) return true;   // activado a mano con !bot on
-
+function enHorarioAutomatico() {
     const partes = new Intl.DateTimeFormat('en-US', {
-        timeZone: 'America/Lima',
-        hourCycle: 'h23',
-        hour: 'numeric',
-        minute: 'numeric'
+        timeZone: 'America/Lima', hourCycle: 'h23', hour: 'numeric', minute: 'numeric'
     }).formatToParts(new Date());
-
-    let hora = 0;
-    let minutos = 0;
-    for (const part of partes) {
-        if (part.type === 'hour') hora = parseInt(part.value, 10) % 24;
-        if (part.type === 'minute') minutos = parseInt(part.value, 10);
-    }
-    const minutosTotales = hora * 60 + minutos;
-
-    // Cruza la medianoche: 22:00 -> 24:00 y 00:00 -> 06:30
-    return minutosTotales >= BOT_INICIO_MIN || minutosTotales < BOT_FIN_MIN;
+    const hora = parseInt(partes.find((p) => p.type === 'hour').value, 10) % 24;
+    const minuto = parseInt(partes.find((p) => p.type === 'minute').value, 10);
+    const total = hora * 60 + minuto;
+    return total >= BOT_INICIO_MIN || total < BOT_FIN_MIN;   // cruza la medianoche
 }
+
+const esHorarioDeBot = () => ignorarHorario || enHorarioAutomatico();
 
 function estaChatPausado(chatId) {
     if (!chatsPausados[chatId]) return false;
@@ -341,43 +346,79 @@ function estaChatPausado(chatId) {
 }
 
 // =========================================================================
-// 4. UTILIDADES DE ENVÍO Y TEXTO
+// 6. GEMINI
+// =========================================================================
+let clienteGemini = null;
+async function obtenerGemini() {
+    if (!GEMINI_API_KEY) throw new Error('Falta la variable GEMINI_API_KEY en Render');
+    if (!clienteGemini) {
+        const { GoogleGenAI } = await import('@google/genai');
+        clienteGemini = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+    }
+    return clienteGemini;
+}
+
+// Gemini exige turnos alternados (cliente / modelo): une los seguidos del mismo rol
+// (pasa cuando una respuesta anterior falló) y exige que empiece con el cliente
+function armarContenido(historial) {
+    const contents = [];
+    for (const m of historial) {
+        const role = m.role === 'model' ? 'model' : 'user';
+        const text = String(m.content ?? '').trim();
+        if (!text) continue;
+        const ultimo = contents[contents.length - 1];
+        if (ultimo && ultimo.role === role) ultimo.parts[0].text += '\n' + text;
+        else contents.push({ role, parts: [{ text }] });
+    }
+    while (contents.length && contents[0].role !== 'user') contents.shift();
+    return contents;
+}
+
+function conTimeout(promesa, ms) {
+    let t;
+    const limite = new Promise((_, rej) => { t = setTimeout(() => rej(new Error('Gemini tardó demasiado')), ms); });
+    return Promise.race([promesa, limite]).finally(() => clearTimeout(t));
+}
+
+async function responderConGemini(historial) {
+    const gemini = await obtenerGemini();
+    const contents = armarContenido(historial);
+    for (let i = 1; ; i++) {
+        try {
+            const r = await conTimeout(gemini.models.generateContent({
+                model: GEMINI_MODEL,
+                contents,
+                config: { systemInstruction: PROMPT_SISTEMA_AVI }
+            }), 60000);
+            return String(r.text || '').trim();
+        } catch (e) {
+            if ((e?.status === 503 || e?.status === 429) && i < 3) {
+                console.warn(`[Gemini ${e.status}] reintentando (${i}/3)...`);
+                await esperar(1500 * i);
+                continue;
+            }
+            throw e;
+        }
+    }
+}
+
+// =========================================================================
+// 7. ENVÍO Y COMANDOS ADMIN
 // =========================================================================
 async function enviar(sock, jid, contenido, opciones) {
     const enviado = await sock.sendMessage(jid, contenido, opciones);
     const id = enviado?.key?.id;
     if (id) {
-        mensajesDelBot.add(id);
-        if (mensajesDelBot.size > 500) {
-            mensajesDelBot.delete(mensajesDelBot.values().next().value);
-        }
-        if (enviado.message) {
-            mensajesEnviados.set(id, enviado.message);
-            if (mensajesEnviados.size > 1000) {
-                mensajesEnviados.delete(mensajesEnviados.keys().next().value);
-            }
-        }
+        enviados.set(id, enviado.message || null);
+        if (enviados.size > 1000) enviados.delete(enviados.keys().next().value);
     }
     return enviado;
 }
 
-function extraerTexto(msg) {
-    return (
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        ''
-    ).trim();
-}
-
-// =========================================================================
-// 5. COMANDOS ADMIN (siempre responden a tu chat personal, nunca al cliente)
-// =========================================================================
 async function ejecutarComando(sock, comando, chatId, numeroReal, destino, salida) {
-    // Si viene 'salida' (panel web) no se manda nada por WhatsApp
-    const responder = salida ? (texto) => salida(texto) : (texto) => enviar(sock, destino || miChat(sock), { text: texto });
+    // Con 'salida' (panel web) no se manda nada por WhatsApp
+    const responder = salida ? (t) => salida(t) : (t) => enviar(sock, destino || miChat(sock), { text: t });
 
-    // Control del bot: !bot on = lo activas a mano (24/7, y Neon habilitado)
-    //                  !bot off / !bot auto = vuelve al horario automático 22:00-06:30
     if (comando === '!bot on') {
         ignorarHorario = true;
         await dbVentana.comando('!db on');
@@ -389,15 +430,17 @@ async function ejecutarComando(sock, comando, chatId, numeroReal, destino, salid
         return responder('🌙 *BOT EN AUTOMÁTICO.* Solo responde de 10:00 PM a 6:30 AM; fuera de ese horario queda apagado.\n' + msg);
     }
     if (comando === '!bot status') {
-        const dentro = (() => { const o = ignorarHorario; ignorarHorario = false; const r = esHorarioDeBot(); ignorarHorario = o; return r; })();
-        return responder(`🤖 *BOT:* ${ignorarHorario ? 'ACTIVADO A MANO (24/7)' : 'AUTOMÁTICO (10 PM - 6:30 AM)'}\n• Ahora mismo: ${esHorarioDeBot() ? 'RESPONDIENDO' : 'APAGADO'}\n• ¿Dentro del horario? ${dentro ? 'sí' : 'no'}`);
+        return responder(
+            `🤖 *BOT:* ${ignorarHorario ? 'ACTIVADO A MANO (24/7)' : 'AUTOMÁTICO (10 PM - 6:30 AM)'}\n` +
+            `• Ahora mismo: ${esHorarioDeBot() ? 'RESPONDIENDO' : 'APAGADO'}\n` +
+            `• ¿Dentro del horario? ${enHorarioAutomatico() ? 'sí' : 'no'}\n` +
+            `• WhatsApp: ${conectado ? 'conectado' : 'desconectado'}\n` +
+            `• Chats pausados: ${Object.keys(chatsPausados).length}`
+        );
     }
-
-    // Comandos de la base de datos Neon
     if (comando.startsWith('!db ')) {
         return responder(await dbVentana.comando(comando));
     }
-
     if (comando === '!admin' || comando === '!help') {
         return responder(
             `🛠️ *MENÚ DE COMANDOS DE ADMINISTRACIÓN*\n\n` +
@@ -415,7 +458,6 @@ async function ejecutarComando(sock, comando, chatId, numeroReal, destino, salid
             `• *!db status* : Ver estado de la base de datos.`
         );
     }
-
     if (comando === '!unpause' || comando === '!despausar') {
         if (chatId === 'panel' || esChatPropio(sock, chatId)) {
             return responder('⚙️ *ADMIN:* Escribe !unpause dentro del chat del cliente, o usa !unpause all.');
@@ -427,7 +469,6 @@ async function ejecutarComando(sock, comando, chatId, numeroReal, destino, salid
         }
         return responder(`⚙️ *ADMIN:* El chat de +${numeroReal} no estaba pausado.`);
     }
-
     if (comando === '!unpause all' || comando === '!despausar todo') {
         chatsPausados = {};
         guardarPausas();
@@ -436,8 +477,10 @@ async function ejecutarComando(sock, comando, chatId, numeroReal, destino, salid
 }
 
 // =========================================================================
-// 6. MANEJADOR DE MENSAJES
+// 8. MENSAJES ENTRANTES
 // =========================================================================
+const normalizar = typeof normalizeMessageContent === 'function' ? normalizeMessageContent : (m) => m;
+
 async function procesarMensaje(sock, msg) {
     if (!msg.message) return;
 
@@ -449,26 +492,25 @@ async function procesarMensaje(sock, msg) {
         idRemitente.endsWith('@newsletter')
     ) return;
 
-    if (msg.key.id && mensajesDelBot.has(msg.key.id)) return;
+    if (msg.key.id && enviados.has(msg.key.id)) return;   // lo envió el propio bot
 
-    const tiposTecnicos = [
-        'protocolMessage', 'reactionMessage', 'senderKeyDistributionMessage',
-        'messageContextInfo', 'pollUpdateMessage', 'keepInChatMessage'
-    ];
-    const tiposReales = Object.keys(msg.message).filter((k) => !tiposTecnicos.includes(k));
-    if (tiposReales.length === 0) return;
+    // Quita el envoltorio (mensajes temporales, ver una vez...) y los mensajes técnicos de WhatsApp
+    const contenido = normalizar(msg.message) || {};
+    const tipos = Object.keys(contenido).filter((k) => !TIPOS_TECNICOS.includes(k));
+    if (!tipos.length) return;
+    const esTexto = tipos[0] === 'conversation' || tipos[0] === 'extendedTextMessage';
+    const userMessage = (contenido.conversation || contenido.extendedTextMessage?.text || '').trim();
 
     const esMensajeMio = msg.key.fromMe;
 
     // Ignora mensajes viejos que WhatsApp reenvía al reconectar (si no, pausarían chats por error)
     const ts = aNumero(msg.messageTimestamp);
     const edadSeg = ts ? (Date.now() / 1000 - ts) : 0;
-    if (esMensajeMio && edadSeg > 90) return;     // tus mensajes: solo los recientes
-    if (!esMensajeMio && edadSeg > 900) return;   // clientes: hasta 15 min de antigüedad
+    if (esMensajeMio && edadSeg > 90) return;
+    if (!esMensajeMio && edadSeg > 900) return;
 
     // Número real (si el chat viene como LID, WhatsApp manda el número en remoteJidAlt)
     const numeroReal = soloNumero(msg.key.remoteJidAlt || idRemitente);
-    const userMessage = extraerTexto(msg);
     const mensajeLower = userMessage.toLowerCase();
     const esComandoAdmin = COMANDOS_ADMIN.includes(mensajeLower);
 
@@ -501,13 +543,12 @@ async function procesarMensaje(sock, msg) {
     if (estaChatPausado(idRemitente)) return;
     if (!esHorarioDeBot()) return;
 
-    // Anti-Spam
+    // Anti-spam: más de 4 mensajes en 10 segundos pausa el chat 5 minutos
     const ahora = Date.now();
-    if (!registroSpam[idRemitente]) registroSpam[idRemitente] = [];
-    registroSpam[idRemitente] = registroSpam[idRemitente].filter(ts => ahora - ts < 10000);
-    registroSpam[idRemitente].push(ahora);
-
-    if (registroSpam[idRemitente].length > 4) {
+    const recientes = (registroSpam[idRemitente] || []).filter((t) => ahora - t < 10000);
+    recientes.push(ahora);
+    registroSpam[idRemitente] = recientes;
+    if (recientes.length > 4) {
         chatsPausados[idRemitente] = ahora + (5 * 60 * 1000);
         guardarPausas();
         registrarAlerta(`Anti-spam: se pausó el chat de +${numeroReal}`);
@@ -515,12 +556,10 @@ async function procesarMensaje(sock, msg) {
         return;
     }
 
-    const tipoMsg = Object.keys(msg.message)[0];
-    if (tipoMsg !== 'conversation' && tipoMsg !== 'extendedTextMessage') {
+    if (!esTexto) {
         await enviar(sock, idRemitente, { text: '¡Hola! Por el momento solo puedo leer mensajes en texto. ¿En qué te puedo ayudar?' }, { quoted: msg });
         return;
     }
-
     if (!userMessage) return;
 
     agregarMensajeAHistorial(idRemitente, 'user', userMessage);
@@ -529,81 +568,32 @@ async function procesarMensaje(sock, msg) {
     try { await sock.sendPresenceUpdate('composing', idRemitente); } catch (e) {}
 
     let replyText;
-
-    const gemini = await obtenerGemini();
-    if (gemini) {
-        try {
-            replyText = await generarConGemini(gemini, historialesChats[idRemitente] || []);
-            if (!replyText) replyText = 'Sin respuesta válida del servidor.';
-        } catch (error) {
-            console.error('--- ERROR EN GEMINI DIRECTO ---', error?.status || '', error?.message || error);
-            await enviar(sock, idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
-            return;
-        }
-    } else {
-        const response = await axios.post(
-            API_URL,
-            {
-                systemInstruction: PROMPT_SISTEMA_AVI,
-                message: userMessage,
-                prompt: userMessage,
-                userId: idRemitente,
-                history: historialesChats[idRemitente] || [],
-                maxTokens: 150
-            },
-            {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 120000,
-                validateStatus: (status) => status >= 200 && status < 600
-            }
-        );
-
-        if (response.status !== 200) {
-            console.log('--- ERROR HTTP DETECTADO EN API ---', response.status);
-            try {
-                const cuerpo = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-                console.log('Detalle del error de la API:', String(cuerpo).slice(0, 800));
-                const h = response.headers || {};
-                console.log('Cabeceras de la API:', JSON.stringify({
-                    server: h['server'],
-                    poweredBy: h['x-powered-by'],
-                    retryAfter: h['retry-after'],
-                    renderOrigin: h['x-render-origin-server'],
-                    rndrId: h['rndr-id'],
-                    cfRay: h['cf-ray'],
-                    contentType: h['content-type']
-                }));
-                console.log('Tamaño del prompt enviado (caracteres):', String(PROMPT_SISTEMA_AVI).length);
-            } catch (e) {}
-            await enviar(sock, idRemitente, { text: 'Hola, ocurrió un inconveniente temporal en el servidor. Por favor intenta de nuevo en un momento.' }, { quoted: msg });
-            return;
-        }
-
-        replyText = String(
-            response.data.reply || response.data.message || response.data.response || 'Sin respuesta válida del servidor.'
-        );
+    try {
+        replyText = await responderConGemini(historialesChats[idRemitente] || []);
+    } catch (error) {
+        console.error('❌ Gemini falló:', error?.status || '', error?.message || error);
+        registrarAlerta(`Gemini falló (${error?.status || 'sin código'}) con +${numeroReal}: ${error?.message || error}`);
+        await enviar(sock, idRemitente, { text: MENSAJE_ERROR }, { quoted: msg });
+        return;
+    }
+    if (!replyText) {
+        registrarAlerta(`Gemini devolvió una respuesta vacía para +${numeroReal}`);
+        await enviar(sock, idRemitente, { text: MENSAJE_ERROR }, { quoted: msg });
+        return;
     }
 
     if (replyText.includes('[TRANSFERIR_HUMANO]')) {
-        const regex = /\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i;
-        const match = replyText.match(regex);
-
-        let resumen = 'El cliente solicitó atención directa.';
-        let pregunta = userMessage;
-        if (match) {
-            resumen = match[1].trim();
-            pregunta = match[2].trim();
-        }
+        const match = replyText.match(/\[TRANSFERIR_HUMANO\]\s*RESUMEN:\s*([\s\S]*?)\s*PREGUNTA:\s*([\s\S]*?)\s*\[\/TRANSFERIR_HUMANO\]/i);
+        const resumen = match ? match[1].trim() : 'El cliente solicitó atención directa.';
+        const pregunta = match ? match[2].trim() : userMessage;
 
         registrarAlerta(`Asesor humano: +${numeroReal} — ${resumen} | ${pregunta}`);
         await enviar(sock, miChat(sock), {
             text: `🚨 *SOLICITUD DE ASESOR HUMANO*\n\n📱 *Cliente:* +${numeroReal}\n📋 *Resumen:* ${resumen}\n❓ *Consulta:* ${pregunta}`
         });
 
-        replyText = replyText.replace(/\[TRANSFERIR_HUMANO\][\s\S]*?\[\/TRANSFERIR_HUMANO\]/gi, '').trim();
-        if (!replyText) {
-            replyText = 'Claro que sí, con gusto. Le acabo de notificar a uno de nuestros asesores para que tome tu caso personalmente en breve.';
-        }
+        replyText = replyText.replace(/\[TRANSFERIR_HUMANO\][\s\S]*?\[\/TRANSFERIR_HUMANO\]/gi, '').trim()
+            || 'Claro que sí, con gusto. Le acabo de notificar a uno de nuestros asesores para que tome tu caso personalmente en breve.';
 
         chatsPausados[idRemitente] = Date.now() + (4 * 60 * 60 * 1000);
         guardarPausas();
@@ -614,12 +604,8 @@ async function procesarMensaje(sock, msg) {
 }
 
 // =========================================================================
-// 7. CONEXIÓN A WHATSAPP (BAILEYS)
+// 9. CONEXIÓN A WHATSAPP (BAILEYS)
 // =========================================================================
-let sockActual = null;
-let reconexionProgramada = false;
-let intentos = 0;
-
 function programarReconexion(ms) {
     if (reconexionProgramada || apagando) return;
     reconexionProgramada = true;
@@ -645,7 +631,7 @@ async function iniciarBot() {
     console.log('🚀 Iniciando motor de Baileys...');
     cerrarSocketAnterior();
 
-    // Carga la sesión UNA vez (en reconexiones reutiliza la memoria, no vuelve a leer Neon)
+    // La sesión se carga UNA vez (en reconexiones se reutiliza la memoria, no se vuelve a leer Neon)
     authActual = await usePostgresAuthState(pool, 'avi');
     const { state, saveCreds } = authActual;
 
@@ -656,15 +642,12 @@ async function iniciarBot() {
 
     const sock = makeWASocket({
         version,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, logger)
-        },
+        auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
         logger,
         browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
-        getMessage: async (key) => mensajesEnviados.get(key.id),
+        getMessage: async (key) => enviados.get(key.id) || undefined,
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: undefined,
         keepAliveIntervalMs: 25000,
@@ -685,11 +668,7 @@ async function iniciarBot() {
             try {
                 const codigo = await sock.requestPairingCode(PAIRING_NUMBER);
                 latestPairingCode = codigo.match(/.{1,4}/g).join('-');
-                console.log('\n==============================================');
-                console.log(`🔑 CÓDIGO DE VINCULACIÓN: ${latestPairingCode}`);
-                console.log('   WhatsApp → Dispositivos vinculados → Vincular dispositivo');
-                console.log('   → "Vincular con el número de teléfono" → escribe el código');
-                console.log('==============================================\n');
+                console.log(`🔑 CÓDIGO DE VINCULACIÓN: ${latestPairingCode}  (también en /qr)`);
             } catch (e) {
                 codigoSolicitado = false;
                 console.error('❌ No se pudo generar el código de vinculación:', e?.message || e);
@@ -698,20 +677,18 @@ async function iniciarBot() {
 
         if (qr) {
             latestQR = qr;
-            console.log('\n--- CÓDIGO QR RECIBIDO ---');
-            console.log(`🔗 Ábrelo en: ${SELF_URL || 'https://TU-SERVICIO.onrender.com'}/qr${QR_TOKEN ? '?key=TU_CLAVE' : ''}`);
-            qrcodeTerminal.generate(qr, { small: true });
+            console.log(`📲 QR listo: ábrelo en ${SELF_URL || 'https://TU-SERVICIO.onrender.com'}/qr?key=${QR_TOKEN}`);
         }
 
         if (connection === 'close') {
             conectado = false;
             const error = lastDisconnect?.error;
             const statusCode = error?.output?.statusCode;
-
             console.log(`⚠️ Conexión cerrada | código: ${statusCode ?? 'sin código'} | motivo: ${error?.message || error || 'desconocido'}`);
 
             if (statusCode === DisconnectReason.loggedOut) {
                 console.log('❌ Sesión cerrada desde el celular. Limpiando sesión en la base de datos...');
+                registrarAlerta('WhatsApp cerró la sesión (dispositivo desvinculado). Hay que vincular de nuevo en /qr');
                 try { await authActual.clearAll(); } catch (e) {
                     console.error('No se pudo limpiar la sesión:', e?.message || e);
                 }
@@ -729,7 +706,7 @@ async function iniciarBot() {
             }
 
             if (statusCode === DisconnectReason.restartRequired) {
-                return programarReconexion(1000);
+                return programarReconexion(1000);   // normal justo después de vincular
             }
 
             intentos++;
@@ -741,24 +718,17 @@ async function iniciarBot() {
             latestQR = '';
             latestPairingCode = '';
             intentos = 0;
-            console.log(`\n==============================================`);
-            console.log(`✅ ¡Avi en línea! Conectado con éxito a WhatsApp.`);
-            console.log(`   Cuenta: ${sock.user?.id || '?'} | LID: ${sock.user?.lid || '?'} | Admin → ${miChat(sock)}`);
-            console.log(`==============================================\n`);
+            console.log(`✅ ¡Avi en línea! Cuenta: ${sock.user?.id || '?'} | LID: ${sock.user?.lid || '?'} | Admin → ${miChat(sock)}`);
         }
     });
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    sock.ev.on('messages.upsert', ({ messages, type }) => {
         if (type !== 'notify') return;
         for (const msg of messages) {
-            try {
-                await procesarMensaje(sock, msg);
-            } catch (error) {
-                console.error('====================================');
-                console.error('   DETALLE DE ERROR EN MENSAJE   ');
-                console.error(error?.message || error);
-                console.error('====================================');
-            }
+            const jid = msg.key?.remoteJid;
+            if (!jid) continue;
+            enCola(jid, () => procesarMensaje(sock, msg))
+                .catch((error) => console.error('❌ Error al procesar mensaje:', error?.message || error));
         }
     });
 }
@@ -767,24 +737,22 @@ process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e?.
 process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.message || e));
 
 // =========================================================================
-// 8. ARRANQUE Y APAGADO ORDENADO
+// 10. ARRANQUE Y APAGADO ORDENADO
 // =========================================================================
 async function main() {
+    if (!GEMINI_API_KEY) console.error('⚠️ GEMINI_API_KEY no está definida: Avi no podrá responder. Agrégala en Environment.');
+    else console.log(`🤖 Gemini directo activo (modelo: ${GEMINI_MODEL}).`);
+
     pool = crearPool();
     // 1) Habilita Neon, programa los guardados y el apagado nocturno/diurno.
     //    Mientras WhatsApp no esté vinculado, mantiene Neon habilitado.
     await dbVentana.arrancar(pool, {
         forzarSi: () => Boolean(authActual && !authActual.registrado())
     });
-    // 2) Espera a que la instancia vieja suelte la sesión (usa Neon solo ahora)
+    // 2) Espera a que la instancia vieja suelte la sesión
     lockClient = await adquirirBloqueo(pool);
     // 3) Carga pausas e historiales a memoria
     await cargarMemoria();
-    if (GEMINI_API_KEY) {
-        console.log(`🤖 Modo Gemini DIRECTO activo (modelo: ${GEMINI_MODEL}).`);
-    } else {
-        console.log('⚠️ GEMINI_API_KEY no está definida en este servicio: se usa la API de avior-ai (da 429). Agrégala en Environment.');
-    }
     // 4) Conecta WhatsApp
     await iniciarBot();
 }

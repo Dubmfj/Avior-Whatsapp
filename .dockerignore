@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+session-baileys
+session-avior
+.wwebjs_cache
+historiales.json
+pausas.json
+.env
