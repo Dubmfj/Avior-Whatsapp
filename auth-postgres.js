@@ -1,269 +1,368 @@
-// auth-postgres.js  (reemplaza al anterior; mismas exportaciones que usa tu index.js)
+// auth-postgres.js  (versión con "guardado en lote" para usar con db-ventana.js)
 //
-// IDEA CLAVE: Neon solo gasta horas mientras recibe consultas. Por eso:
-//   - TODO se lee/escribe en MEMORIA durante el uso normal (claves Signal, creds, pausas, historiales).
-//   - Los cambios se acumulan y se guardan en LOTE (flush) cada X minutos, desde db-ventana.js.
-//   - No hay conexión permanente: el pool cierra conexiones inactivas a los 10 s.
-//   - El "bloqueo de instancia única" ya no es un advisory lock (se pierde cuando Neon suspende):
-//     es una fila "lease" que se toma al arrancar y se suelta al apagar.
+// Idea: la sesión de WhatsApp (claves Signal, creds), las pausas y los historiales viven en
+// MEMORIA mientras el bot corre. Solo se escriben en Postgres (Neon) cuando db-ventana.js
+// llama a flushTodo(), y al apagar. Así Neon puede estar suspendida casi todo el día.
 //
-// OJO: usa tablas NUEVAS (wa_auth, wa_kv, wa_lease). La primera vez tendrás que vincular
-// WhatsApp de nuevo (código de vinculación), porque no lee el esquema de tu módulo anterior.
-
+// Qué protege la "propiedad de la sesión" (tabla baileys_owner):
+//   - Al arrancar, esta instancia ESPERA a que la anterior termine de guardar y suelte la sesión.
+//     Si pasan ESPERA_PROPIEDAD_SEG (90 s) sin que la suelte (se cayó de golpe), la toma a la fuerza.
+//   - Cada guardado verifica que seguimos siendo dueños. Si otra instancia tomó la sesión,
+//     NO se escribe nada, se descarta lo pendiente y el proceso se cierra.
+//
+// Requiere: npm i pg
+const crypto = require('crypto');
 const { Pool } = require('pg');
-const { initAuthCreds, BufferJSON, proto } = require('@whiskeysockets/baileys');
+const { proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
+
+const SESION_LOCK = 'avi';                         // clave de la fila de propiedad
+const INSTANCIA_ID = crypto.randomUUID();          // identidad de ESTE proceso
+const ESPERA_MAX_SEG = Number(process.env.ESPERA_PROPIEDAD_SEG) || 90;
+const LOTE_MAX = 500;                              // filas por consulta al guardar
 
 const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
-const OWNER = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const serializar = (v) => JSON.stringify(v, BufferJSON.replacer);
+const parsear = (s) => JSON.parse(s, BufferJSON.reviver);
 
-// ---------------------------------------------------------------------------
-// Pool + consultas con reintento (el primer query tras una suspensión tarda 1-3 s)
-// ---------------------------------------------------------------------------
+function configPg() {
+    if (!process.env.DATABASE_URL) throw new Error('Falta la variable DATABASE_URL');
+    return {
+        connectionString: process.env.DATABASE_URL,
+        // PGSSL=off si usas la URL interna de Render; por defecto SSL sin verificar
+        ssl: process.env.PGSSL === 'off' ? false : { rejectUnauthorized: false },
+        keepAlive: true,
+        connectionTimeoutMillis: 15000,   // despertar Neon puede tardar unos segundos
+        query_timeout: 20000
+    };
+}
+
 function crearPool() {
-    const pool = new Pool({
-        connectionString: process.env.DATABASE_URL, // con ?sslmode=require
-        max: 2,
-        idleTimeoutMillis: 10000,       // suelta conexiones ociosas rápido
-        connectionTimeoutMillis: 30000  // tolera el arranque en frío de Neon
-    });
-    // Neon corta conexiones al suspender: sin este handler, 'error' tumba el proceso
-    pool.on('error', (e) => console.warn('[pg] conexión inactiva cerrada:', e.message));
+    const pool = new Pool({ ...configPg(), max: 5 });
+    // Cuando Neon se deshabilita/suspende, cierra las conexiones inactivas: es normal, no es un fallo.
+    pool.on('error', (e) => console.warn('⚠️ Conexión inactiva de Postgres cerrada (normal si Neon se suspendió):', e.message));
     return pool;
 }
 
-async function q(pool, texto, params, intentos = 4) {
-    for (let i = 0; ; i++) {
-        try {
-            return await pool.query(texto, params);
-        } catch (e) {
-            if (i >= intentos - 1) throw e;
-            await dormir(1500 * (i + 1));
-        }
-    }
+async function prepararTablas(pool) {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS baileys_auth (
+            session_id TEXT NOT NULL,
+            key        TEXT NOT NULL,
+            value      TEXT NOT NULL,
+            PRIMARY KEY (session_id, key)
+        )`);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS baileys_owner (
+            session_id TEXT PRIMARY KEY,
+            owner      TEXT NOT NULL,
+            beat       TIMESTAMPTZ NOT NULL
+        )`);
 }
 
-async function asegurarTablas(pool) {
-    await q(pool, `CREATE TABLE IF NOT EXISTS wa_auth (
-        sesion TEXT NOT NULL, clave TEXT NOT NULL, valor TEXT NOT NULL,
-        PRIMARY KEY (sesion, clave))`);
-    await q(pool, `CREATE TABLE IF NOT EXISTS wa_kv (clave TEXT PRIMARY KEY, valor TEXT NOT NULL)`);
-    await q(pool, `CREATE TABLE IF NOT EXISTS wa_lease (id INT PRIMARY KEY, owner TEXT, tomado TIMESTAMPTZ)`);
+// -------------------------------------------------------------------------
+// Estado en memoria + cambios pendientes de guardar
+// -------------------------------------------------------------------------
+let poolRef = null;
+let sesion = null;                 // { id, api }  -> se reutiliza en reconexiones (no relee la base)
+let sesionId = 'avi';
+let credsActual = null;            // objeto creds vivo de Baileys
+let pendKeys = new Map();          // clave -> texto JSON | null (null = borrar)
+let pendKv = new Set();            // claves de pausas/historiales pendientes
+const kvMem = new Map();           // pausas/historiales en memoria
+let credsPend = false;
+let borrarSesion = false;          // pedido de borrar toda la sesión (loggedOut)
+let flushEnCurso = null;
+
+function hayPendiente() {
+    return pendKeys.size > 0 || pendKv.size > 0 || credsPend || borrarSesion;
 }
 
-// ---------------------------------------------------------------------------
-// Instancia única (lease). Se toma al arrancar, se suelta al apagar. Sin heartbeat:
-// un heartbeat mantendría Neon despierto. Si la instancia anterior murió sin soltarla,
-// esperamos esperaMaxMs y la tomamos a la fuerza.
-// ---------------------------------------------------------------------------
-async function adquirirBloqueo(pool, esperaMaxMs = 120000) {
-    await asegurarTablas(pool);
-    const limite = Date.now() + esperaMaxMs;
+// Se usa cuando otra instancia tomó la sesión: nuestras claves serían viejas y pisarían las suyas
+function descartarPendiente() {
+    pendKeys = new Map();
+    pendKv = new Set();
+    credsPend = false;
+    borrarSesion = false;
+}
+
+// -------------------------------------------------------------------------
+// Propiedad de la sesión
+// -------------------------------------------------------------------------
+function salirPorPerdidaDePropiedad(motivo) {
+    console.error(`❌ ${motivo}. Saliendo para que Render reinicie esta instancia limpia.`);
+    process.exit(1);
+}
+
+async function renovar(q) {
+    const r = await q.query(
+        'UPDATE baileys_owner SET beat = now() WHERE session_id = $1 AND owner = $2',
+        [SESION_LOCK, INSTANCIA_ID]
+    );
+    return r.rowCount === 1;
+}
+
+async function adquirirBloqueo(pool) {
+    poolRef = pool;
+    await prepararTablas(pool);
+    const inicio = Date.now();
+
     for (;;) {
-        const r = await q(pool,
-            `INSERT INTO wa_lease (id, owner, tomado) VALUES (1, $1, now())
-             ON CONFLICT (id) DO UPDATE SET owner = $1, tomado = now()
-             WHERE wa_lease.owner IS NULL OR wa_lease.owner = $1
-             RETURNING owner`, [OWNER]);
-        if (r.rowCount > 0) break;
-        if (Date.now() > limite) {
-            console.warn('⚠️ La instancia anterior no soltó la sesión a tiempo. Tomándola a la fuerza.');
-            await q(pool, `UPDATE wa_lease SET owner = $1, tomado = now() WHERE id = 1`, [OWNER]);
+        // Se adquiere si no hay dueño, si ya somos nosotros, o si el dueño anterior la soltó
+        // (beat = epoch, que es como la dejaba la versión anterior al apagarse)
+        const r = await pool.query(
+            `INSERT INTO baileys_owner (session_id, owner, beat) VALUES ($1, $2, now())
+             ON CONFLICT (session_id) DO UPDATE SET owner = EXCLUDED.owner, beat = now()
+             WHERE baileys_owner.owner = EXCLUDED.owner
+                OR baileys_owner.beat <= to_timestamp(0)
+             RETURNING owner`,
+            [SESION_LOCK, INSTANCIA_ID]
+        );
+        if (r.rowCount === 1) break;
+
+        if (Date.now() - inicio >= ESPERA_MAX_SEG * 1000) {
+            console.warn(`⚠️ La instancia anterior no soltó la sesión en ${ESPERA_MAX_SEG}s (¿se cayó?). Tomándola.`);
+            await pool.query(
+                `INSERT INTO baileys_owner (session_id, owner, beat) VALUES ($1, $2, now())
+                 ON CONFLICT (session_id) DO UPDATE SET owner = EXCLUDED.owner, beat = now()`,
+                [SESION_LOCK, INSTANCIA_ID]
+            );
             break;
         }
-        console.log('⏳ Esperando que la instancia anterior suelte la sesión de WhatsApp...');
-        await dormir(5000);
+        console.log('⏳ Otra instancia es dueña de la sesión de WhatsApp; esperando que termine de guardar...');
+        await dormir(3000);
     }
+    console.log(`🔒 Propiedad de la sesión adquirida (instancia ${INSTANCIA_ID.slice(0, 8)}).`);
+
     return {
+        // Se llama al apagar, DESPUÉS de guardar: deja la sesión libre al instante para la instancia nueva
         liberar: async () => {
-            await q(pool, `UPDATE wa_lease SET owner = NULL WHERE id = 1 AND owner = $1`, [OWNER], 2);
+            await pool.query(
+                'DELETE FROM baileys_owner WHERE session_id = $1 AND owner = $2',
+                [SESION_LOCK, INSTANCIA_ID]
+            );
+            console.log('🔓 Propiedad de la sesión liberada.');
         }
     };
 }
 
-// ---------------------------------------------------------------------------
-// Auth de Baileys: carga todo UNA vez, trabaja en memoria, guarda en lote
-// ---------------------------------------------------------------------------
-const sesiones = new Map(); // sesion -> estado (reutilizado entre reconexiones de Baileys)
+// -------------------------------------------------------------------------
+// Auth state en memoria (reemplazo de useMultiFileAuthState)
+// -------------------------------------------------------------------------
+async function usePostgresAuthState(pool, sessionId = 'avi') {
+    poolRef = pool;
+    // Reconexión: se reutiliza la sesión que ya está en memoria (no se vuelve a leer la base)
+    if (sesion && sesion.id === sessionId) return sesion.api;
 
-async function usePostgresAuthState(pool, sesion) {
-    if (sesiones.has(sesion)) return sesiones.get(sesion); // reconexión: NO vuelve a leer la DB
+    await prepararTablas(pool);
+    sesionId = sessionId;
 
-    const cache = new Map();   // clave -> valor
-    const sucias = new Set();  // claves con cambios sin guardar
-
-    const r = await q(pool, 'SELECT clave, valor FROM wa_auth WHERE sesion = $1', [sesion]);
-    for (const f of r.rows) {
-        try { cache.set(f.clave, JSON.parse(f.valor, BufferJSON.reviver)); } catch (e) {}
+    const store = new Map();   // clave -> texto JSON
+    let creds = null;
+    if (!borrarSesion) {
+        const { rows } = await pool.query(
+            'SELECT key, value FROM baileys_auth WHERE session_id = $1',
+            [sessionId]
+        );
+        for (const r of rows) {
+            if (r.key === 'creds') creds = parsear(r.value);
+            else store.set(r.key, r.value);
+        }
     }
-
-    let creds = cache.get('creds');
     if (!creds) {
         creds = initAuthCreds();
-        cache.set('creds', creds);
-        sucias.add('creds');
+        credsPend = true;     // identidad nueva: hay que guardarla
     }
+    credsActual = creds;
+
+    const estaVinculado = () => Boolean(creds.registered || creds.me?.id);
+    let urgenteHecho = estaVinculado();
 
     const keys = {
         get: async (type, ids) => {
-            const data = {};
+            const out = {};
             for (const id of ids) {
-                let v = cache.get(`${type}-${id}`);
+                const raw = store.get(`${type}-${id}`);
+                if (!raw) continue;
+                let v = parsear(raw);
                 if (type === 'app-state-sync-key' && v) {
                     v = proto.Message.AppStateSyncKeyData.fromObject(v);
                 }
-                data[id] = v;
+                out[id] = v;
             }
-            return data;
+            return out;
         },
         set: async (data) => {
-            for (const type in data) {
-                for (const id in data[type]) {
-                    const k = `${type}-${id}`;
-                    const v = data[type][id];
-                    if (v) cache.set(k, v); else cache.delete(k);
-                    sucias.add(k);
+            for (const categoria of Object.keys(data)) {
+                for (const id of Object.keys(data[categoria])) {
+                    const valor = data[categoria][id];
+                    const key = `${categoria}-${id}`;
+                    if (valor) {
+                        const texto = serializar(valor);
+                        store.set(key, texto);
+                        pendKeys.set(key, texto);
+                    } else {
+                        store.delete(key);
+                        pendKeys.set(key, null);
+                    }
                 }
             }
         }
     };
 
-    async function flush() {
-        if (!sucias.size) return 0;
-        const lote = [...sucias];
-        sucias.clear();
-        const upK = [], upV = [], del = [];
-        for (const k of lote) {
-            const v = cache.get(k);
-            if (v === undefined) del.push(k);
-            else { upK.push(k); upV.push(JSON.stringify(v, BufferJSON.replacer)); }
-        }
-        try {
-            if (upK.length) {
-                await q(pool,
-                    `INSERT INTO wa_auth (sesion, clave, valor)
-                     SELECT $1, t.k, t.v FROM unnest($2::text[], $3::text[]) AS t(k, v)
-                     ON CONFLICT (sesion, clave) DO UPDATE SET valor = EXCLUDED.valor`,
-                    [sesion, upK, upV]);
-            }
-            if (del.length) {
-                await q(pool, `DELETE FROM wa_auth WHERE sesion = $1 AND clave = ANY($2::text[])`, [sesion, del]);
-            }
-        } catch (e) {
-            for (const k of lote) sucias.add(k); // no perder cambios si la DB estaba apagada
-            throw e;
-        }
-        return lote.length;
-    }
-
-    // Mientras la cuenta no esté vinculada, guarda de inmediato (un fallo aquí obliga a re-escanear)
-    let sinRegistrar = !creds.registered;
     const saveCreds = async () => {
-        sucias.add('creds');
-        if (sinRegistrar) {
-            try { await flush(); } catch (e) { console.error('No se pudo guardar creds:', e.message); }
-            if (creds.registered) sinRegistrar = false;
+        credsPend = true;
+        // Justo al vincular WhatsApp se guarda enseguida (no esperar al guardado periódico):
+        // si Render reiniciara en ese rato, habría que vincular otra vez.
+        if (!urgenteHecho && estaVinculado()) {
+            urgenteHecho = true;
+            setTimeout(() => {
+                flushTodo(poolRef).catch((e) => console.error('❌ Falló el guardado tras vincular:', e?.message || e));
+            }, 2000);
         }
     };
 
+    // Borra TODA la sesión (WhatsApp devolvió loggedOut). Si la base está apagada ahora,
+    // el borrado queda pendiente y se aplica en el próximo guardado.
     const clearAll = async () => {
-        cache.clear();
-        sucias.clear();
-        sesiones.delete(sesion);
-        await q(pool, 'DELETE FROM wa_auth WHERE sesion = $1', [sesion]);
+        store.clear();
+        pendKeys = new Map();
+        credsPend = false;
+        credsActual = null;
+        sesion = null;
+        borrarSesion = true;
+        try { await flushTodo(poolRef); } catch (e) {
+            console.error('No se pudo borrar la sesión en la base ahora; queda pendiente:', e?.message || e);
+        }
     };
 
-    const estado = {
+    const api = {
         state: { creds, keys },
         saveCreds,
         clearAll,
-        flush,
-        pendiente: () => sucias.size,
-        registrado: () => Boolean(creds.registered),
-        descartar: () => sucias.clear()
+        registrado: estaVinculado
     };
-    sesiones.set(sesion, estado);
-    return estado;
+    sesion = { id: sessionId, api };
+    return api;
 }
 
-// ---------------------------------------------------------------------------
-// Almacén clave/valor (pausas, historiales): memoria primero, guardado en lote
-// ---------------------------------------------------------------------------
-const kvCache = new Map();
-const kvSucias = new Set();
-
+// -------------------------------------------------------------------------
+// Pausas e historiales (en memoria; se guardan en lote)
+// -------------------------------------------------------------------------
 async function kvGet(pool, clave) {
-    if (kvCache.has(clave)) return kvCache.get(clave);
-    const r = await q(pool, 'SELECT valor FROM wa_kv WHERE clave = $1', [clave]);
-    if (!r.rows[0]) return null;
-    const v = JSON.parse(r.rows[0].valor);
-    kvCache.set(clave, v);
-    return v;
+    if (kvMem.has(clave)) return kvMem.get(clave);
+    const { rows } = await (pool || poolRef).query(
+        "SELECT value FROM baileys_auth WHERE session_id = 'app' AND key = $1",
+        [clave]
+    );
+    if (!rows[0]) return null;
+    const valor = JSON.parse(rows[0].value);
+    kvMem.set(clave, valor);
+    return valor;
 }
 
 async function kvSet(pool, clave, valor) {
-    kvCache.set(clave, valor);
-    kvSucias.add(clave);
+    kvMem.set(clave, valor);
+    pendKv.add(clave);
 }
 
-async function flushKV(pool) {
-    if (!kvSucias.size) return 0;
-    const lote = [...kvSucias];
-    kvSucias.clear();
-    try {
-        for (const k of lote) {
-            await q(pool,
-                `INSERT INTO wa_kv (clave, valor) VALUES ($1, $2)
-                 ON CONFLICT (clave) DO UPDATE SET valor = EXCLUDED.valor`,
-                [k, JSON.stringify(kvCache.get(k))]);
-        }
-    } catch (e) {
-        for (const k of lote) kvSucias.add(k);
-        throw e;
+// -------------------------------------------------------------------------
+// Guardado en lote en Postgres. Devuelve cuántos registros se escribieron.
+// -------------------------------------------------------------------------
+async function escribirLote(client, filas) {
+    for (let i = 0; i < filas.length; i += LOTE_MAX) {
+        const parte = filas.slice(i, i + LOTE_MAX);
+        await client.query(
+            `INSERT INTO baileys_auth (session_id, key, value)
+             SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+             ON CONFLICT (session_id, key) DO UPDATE SET value = EXCLUDED.value`,
+            [parte.map((f) => f[0]), parte.map((f) => f[1]), parte.map((f) => f[2])]
+        );
     }
-    return lote.length;
 }
 
-// ---------------------------------------------------------------------------
-// Guardado global
-// ---------------------------------------------------------------------------
-let enCurso = null;
+async function ejecutarFlush(pool) {
+    // Se toma una "foto" de lo pendiente; lo que llegue mientras se guarda queda para el siguiente guardado
+    const claves = pendKeys; pendKeys = new Map();
+    const kvs = pendKv; pendKv = new Set();
+    const credsSucio = credsPend; credsPend = false;
+    const borrar = borrarSesion; borrarSesion = false;
+    const sid = sesionId;
+    const credsTexto = credsSucio && credsActual ? serializar(credsActual) : null;
 
-function flushTodo(pool) {
-    if (enCurso) return enCurso;
-    enCurso = (async () => {
-        let n = 0;
-        for (const s of sesiones.values()) n += await s.flush();
-        n += await flushKV(pool);
-        return n;
-    })().finally(() => { enCurso = null; });
-    return enCurso;
+    const restaurar = () => {
+        for (const [k, v] of claves) if (!pendKeys.has(k)) pendKeys.set(k, v);
+        for (const k of kvs) pendKv.add(k);
+        if (credsSucio) credsPend = true;
+        if (borrar) borrarSesion = true;
+    };
+
+    let client;
+    let perdida = false;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // Cerco: si ya no somos dueños de la sesión, NO se escribe nada
+        if (!(await renovar(client))) {
+            perdida = true;
+            await client.query('ROLLBACK').catch(() => {});
+            descartarPendiente();
+            return salirPorPerdidaDePropiedad('Guardado rechazado: ya no soy dueño de la sesión');
+        }
+
+        if (borrar) await client.query('DELETE FROM baileys_auth WHERE session_id = $1', [sid]);
+
+        const filas = [];
+        const borrados = [];
+        if (credsTexto) filas.push([sid, 'creds', credsTexto]);
+        for (const [k, v] of claves) {
+            if (v === null) borrados.push(k);
+            else filas.push([sid, k, v]);
+        }
+        for (const c of kvs) {
+            if (kvMem.has(c)) filas.push(['app', c, JSON.stringify(kvMem.get(c))]);
+        }
+
+        await escribirLote(client, filas);
+        if (borrados.length) {
+            await client.query(
+                'DELETE FROM baileys_auth WHERE session_id = $1 AND key = ANY($2)',
+                [sid, borrados]
+            );
+        }
+        await client.query('COMMIT');
+        return filas.length + borrados.length;
+    } catch (e) {
+        if (client) await client.query('ROLLBACK').catch(() => {});
+        if (!perdida) restaurar();   // fallo normal: no se pierde nada, se reintenta en el próximo guardado
+        throw e;
+    } finally {
+        if (client) client.release();
+    }
 }
 
-function hayPendiente() {
-    if (kvSucias.size > 0) return true;
-    for (const s of sesiones.values()) if (s.pendiente() > 0) return true;
-    return false;
-}
-
-// Úsalo si otra instancia tomó la sesión (connectionReplaced): NO sobrescribas sus claves
-function descartarPendiente() {
-    kvSucias.clear();
-    for (const s of sesiones.values()) s.descartar();
-}
-
-function sesionRegistrada() {
-    for (const s of sesiones.values()) if (!s.registrado()) return false;
-    return true;
+async function flushTodo(pool) {
+    // Si ya hay un guardado en curso, se espera y luego se guarda lo que haya llegado después
+    while (flushEnCurso) {
+        try { await flushEnCurso; } catch (e) {}
+    }
+    if (!hayPendiente()) return 0;
+    flushEnCurso = ejecutarFlush(pool || poolRef);
+    try {
+        return await flushEnCurso;
+    } finally {
+        flushEnCurso = null;
+    }
 }
 
 module.exports = {
     crearPool,
+    prepararTablas,
     adquirirBloqueo,
     usePostgresAuthState,
     kvGet,
     kvSet,
     flushTodo,
     hayPendiente,
-    descartarPendiente,
-    sesionRegistrada
+    descartarPendiente
 };

@@ -5,14 +5,18 @@
 //   Neon solo cobra horas mientras está despierta (cada guardado la despierta ~5 min).
 //
 // Variables de entorno (todas opcionales):
-//   DB_VENTANA  = "22:00-06:30"   hora de Lima (por defecto); admite varios tramos "07:00-09:00,13:00-23:00"
-//                                 y tramos que cruzan medianoche "22:00-02:00"
-//   FLUSH_MIN   = 20              cada cuántos minutos se guardan los cambios pendientes
+//   DB_VENTANA      = "22:00-06:30"  hora de Lima (por defecto); admite varios tramos "07:00-09:00,13:00-23:00"
+//                                    y tramos que cruzan medianoche "22:00-02:00"
+//   FLUSH_MIN       = 20             DENTRO de la ventana: cada cuántos minutos se guardan los cambios pendientes
+//   FLUSH_FUERA_MIN = 90             FUERA de la ventana: cada cuántos minutos se hace un guardado corto
+//                                    (habilita Neon, guarda y la vuelve a deshabilitar). Así los cambios de
+//                                    WhatsApp nunca quedan más de este tiempo solo en memoria.
 const neon = require('./neon-control');
 const { flushTodo, hayPendiente } = require('./auth-postgres');
 
 const VENTANA = process.env.DB_VENTANA || '22:00-06:30';
 const FLUSH_MS = (Number(process.env.FLUSH_MIN) || 20) * 60 * 1000;
+const FLUSH_FUERA_MS = (Number(process.env.FLUSH_FUERA_MIN) || 90) * 60 * 1000;
 
 let modo = 'auto';        // 'auto' (sigue la ventana) | 'on' (siempre habilitada) | 'off' (siempre apagada)
 let habilitada = null;    // estado que conocemos de Neon
@@ -72,10 +76,18 @@ async function tick() {
         if (debeEstarHabilitada()) {
             await asegurarHabilitada();
             if (hayPendiente() && Date.now() - ultimoFlush >= FLUSH_MS) await guardar('periódico');
-        } else if (habilitada) {
-            // Cierre del día: guarda lo pendiente y deshabilita (suspende al instante)
-            if (hayPendiente()) await guardar('antes de apagar Neon');
-            if (!hayPendiente()) {
+        } else {
+            // FUERA de la ventana. Se guarda si:
+            //   - Neon todavía estaba habilitada (cierre del día: guardar antes de apagar), o
+            //   - pasó FLUSH_FUERA_MS desde el último guardado y hay cambios pendientes
+            //     (guardado corto de día: habilita, guarda y vuelve a deshabilitar).
+            // Antes, de día los cambios (claves de WhatsApp incluidas) podían quedar ~15 h solo en memoria.
+            const toca = Date.now() - ultimoFlush >= FLUSH_FUERA_MS;
+            if (hayPendiente() && (habilitada || toca)) {
+                await asegurarHabilitada();
+                await guardar(habilitada && !toca ? 'antes de apagar Neon' : 'fuera de ventana');
+            }
+            if (habilitada && !hayPendiente()) {
                 await neon.deshabilitar();
                 habilitada = false;
                 console.log('🌙 Neon deshabilitado (fuera de ventana)');
